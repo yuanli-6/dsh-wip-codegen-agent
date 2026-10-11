@@ -56,6 +56,8 @@ for (const script of [
   'index.js',
   'verify.mjs',
   'verify-lifecycle.mjs',
+  'verify-runtime/probe.js',
+  'verify-runtime/run.mjs',
   'check-patch.mjs',
   'check-encoding.mjs'
 ]) {

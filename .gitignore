@@ -4,6 +4,9 @@ node_modules/
 # Memory/cache dirs created by tooling when this folder doubles as a workspace
 .dsh-meow/
 
+# Scratch DSH_HOME created by verify-runtime/run.mjs (never commit it)
+.verify-runtime/
+
 # Lockfiles: this bundle has none of its own (no dependencies)
 pnpm-lock.yaml
 package-lock.json

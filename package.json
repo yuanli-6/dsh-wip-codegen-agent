@@ -1,8 +1,8 @@
 {
   "name": "dsh-wip-codegen-agent",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "DSH bundle: registers the 'wip-codegen' Agent preset — a Java code-generation agent that follows the WIP/HRP team spec.",
+  "description": "DSH bundle: registers the 'wip-codegen' Agent preset — a WIP/HRP agent that generates SQL Server table scripts and Spring Boot 3 + MyBatis-Plus code under an explicit user-confirmation flow, with the api-test interface-testing skill mounted.",
   "keywords": [
     "dsh",
     "dsh-bundle",
@@ -12,7 +12,11 @@
     "codegen",
     "spring-boot",
     "mybatis-plus",
-    "wip"
+    "sql-server",
+    "ddl",
+    "api-test",
+    "wip",
+    "hrp"
   ],
   "type": "module",
   "license": "MIT",
@@ -35,6 +39,7 @@
     "assets",
     "verify.mjs",
     "verify-lifecycle.mjs",
+    "verify-runtime",
     "check-patch.mjs",
     "check-encoding.mjs",
     "README.md",

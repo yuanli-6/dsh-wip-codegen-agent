@@ -70,11 +70,41 @@ check('spec mentions the four required inputs', () => {
     assert(rawSpec.includes(needle), `spec no longer mentions "${needle}"`)
   }
 })
+check('spec carries the SQL Server table-script rules', () => {
+  for (const needle of [
+    '## 十三、SQL Server 建表脚本生成规范',
+    'sp_addextendedproperty',
+    'DATETIME2(0)',
+    'IX_{表名}_{字段名}',
+    'IF OBJECT_ID',
+    '未测试-未发生产.sql'
+  ]) {
+    assert(rawSpec.includes(needle), `spec no longer contains "${needle}"`)
+  }
+})
+check('spec carries the mandatory confirmation flow', () => {
+  for (const needle of [
+    '## 十四、强制交互流程：先确认，再落地',
+    '14.2 SQL 字段确认',
+    '14.3 Java 代码生成确认',
+    '14.4 风格基准',
+    '14.5 删除确认',
+    '14.6 全局规则沉淀',
+    'ask_user_question'
+  ]) {
+    assert(rawSpec.includes(needle), `spec no longer contains "${needle}"`)
+  }
+})
+check('spec exposes an append target for global rules', () => {
+  assert(rawSpec.includes('## 十五、全局规则（用户追加）'), '§十五 is missing, §14.6 would have nowhere to append')
+})
 
 // ── the definition handed to agentPresets.register() ──────────────────────────
-const { buildDefinition, name: pluginName, inject } = await import('./index.js')
+const { buildDefinition, companionAvailable, name: pluginName, inject } = await import('./index.js')
 
-const definition = buildDefinition((message) => warnings.push(message))
+// Rows are asserted against the *intended* shape (companion present); the
+// resolvability gate itself is exercised in its own section below.
+const definition = buildDefinition((message) => warnings.push(message), { apiTest: true })
 
 console.log('')
 console.log('plugin shape')
@@ -109,9 +139,13 @@ check('every row is a well-formed entry', () => {
     assert(typeof row.name === 'string' && row.name.length > 0, `row ${row.id} has no name`)
   }
 })
-check('every row names a first-party harness package', () => {
+check('every row names either a first-party harness package or the declared companion', () => {
   for (const row of definition.plugins) {
-    assert(row.name.startsWith('@deepseek-ai/dsh-'), `row ${row.id} names "${row.name}"`)
+    const firstParty = row.name.startsWith('@deepseek-ai/dsh-')
+    assert(
+      firstParty || row.name === 'dsh-api-test-bundle',
+      `row ${row.id} names "${row.name}", which is neither first-party nor the companion`
+    )
   }
 })
 check('row ids are unique', () => {
@@ -141,11 +175,15 @@ check('persona prefix starts with the spec verbatim', () => {
     'the prompt does not begin with the spec — the asset may have been mangled or replaced by a fallback'
   )
 })
-check('persona prefix is the spec plus only the cwd note', () => {
+check('persona prefix is the spec plus only the trailing notes', () => {
   const expected = rawSpec.replace(/^\uFEFF/, '').trim()
   const extra = persona.config.prefix.slice(expected.length)
   assert(extra.includes('{{cwd}}'), 'the working-directory note is missing, so the agent cannot find a path to write to')
-  assert(extra.length < 200, `unexpected extra prose after the spec (${extra.length} chars)`)
+  assert(
+    extra.includes('system-prompt.md'),
+    'the spec-path note is missing, so §14.6 has no file to append global rules to'
+  )
+  assert(extra.length < 400, `unexpected extra prose after the spec (${extra.length} chars)`)
 })
 check('no fallback body was served', () => {
   assert(!persona.config.prefix.includes('规范正文未能读取'), 'the asset failed to load during this check')
@@ -171,8 +209,68 @@ check('file access, search and interaction tools are present', () => {
     assert(enabledNames.some((n) => n.includes(needle)), `missing ${needle}`)
   }
 })
-check('tool-skill is NOT mounted (keeps the skill catalog out of context)', () => {
-  assert(!definition.plugins.some((row) => row.name.includes('dsh-tool-skill')), 'tool-skill is mounted')
+
+// ── the mounted testing companion ─────────────────────────────────────────────
+console.log('')
+console.log('testing companion (dsh-api-test-bundle)')
+
+check('the companion skill plugin is mounted', () => {
+  assert(
+    definition.plugins.some((row) => row.name === 'dsh-api-test-bundle'),
+    'the api-test skill bundle is not in the preset'
+  )
+})
+check('tool-skill IS mounted, otherwise the companion skill can never load', () => {
+  assert(
+    definition.plugins.some((row) => row.name.includes('dsh-tool-skill')),
+    'without tool-skill nothing renders a catalog and the api-test skill is unreachable'
+  )
+})
+check('the companion row is marked enabled', () => {
+  const row = definition.plugins.find((r) => r.name === 'dsh-api-test-bundle')
+  assert(row.disabled !== true, 'the companion row is disabled')
+})
+check('the catalog description cap is a sane positive integer', () => {
+  const row = definition.plugins.find((r) => r.name.includes('dsh-tool-skill'))
+  const cap = row.config?.catalogDescriptionMaxLength
+  assert(Number.isInteger(cap) && cap >= 3, `catalogDescriptionMaxLength = ${cap}`)
+})
+
+console.log('')
+console.log('companion resolvability gate (a bad row must not kill the Agent)')
+
+const gated = buildDefinition((message) => warnings.push(message), { apiTest: false })
+check('with the companion absent the two skill rows are dropped', () => {
+  assert(!gated.plugins.some((r) => r.name === 'dsh-api-test-bundle'), 'companion row survived the gate')
+  assert(!gated.plugins.some((r) => r.name.includes('dsh-tool-skill')), 'tool-skill row survived the gate')
+  assert(definition.plugins.length - gated.plugins.length === 2, 'the gate should drop exactly two rows')
+})
+check('with the companion absent the Agent still mounts its core rows', () => {
+  const names = gated.plugins.map((r) => r.name)
+  for (const needle of ['dsh-persona', 'dsh-tool-fs', 'dsh-tool-fs-search', 'dsh-tool-ask-user', 'dsh-tool-todo']) {
+    assert(names.some((n) => n.includes(needle)), `core row ${needle} was dropped too`)
+  }
+  const shells = names.filter((n) => n.includes('tool-pwsh') || n.includes('tool-bash'))
+  assert(shells.length === 1, `expected exactly 1 shell row without the companion, got ${shells.length}`)
+  assert(gated.plugins.length === 6, `expected 6 rows without the companion, got ${gated.plugins.length}`)
+})
+check('with the companion absent a diagnostic is emitted', () => {
+  assert(
+    warnings.some((message) => message.includes('dsh-api-test-bundle')),
+    'no warning names the missing companion'
+  )
+})
+check('the real probe is a boolean and the definition is deterministic', () => {
+  assert(typeof companionAvailable() === 'boolean', 'companionAvailable() did not return a boolean')
+  const a = buildDefinition(undefined, { apiTest: true })
+  const b = buildDefinition(undefined, { apiTest: true })
+  assert(JSON.stringify(a) === JSON.stringify(b), 'two builds with the same options differ')
+})
+check('the persona is identical with and without the companion', () => {
+  const withRows = buildDefinition(undefined, { apiTest: true })
+  const without = buildDefinition(undefined, { apiTest: false })
+  const prefixOf = (d) => d.plugins.find((r) => r.name.includes('dsh-persona')).config.prefix
+  assert(prefixOf(withRows) === prefixOf(without), 'the spec text changed with the companion gate')
 })
 check('no delegation or workflow rows are mounted', () => {
   for (const needle of ['dsh-tool-subagent', 'dsh-tool-workflow', 'dsh-tool-ralph']) {
@@ -183,6 +281,48 @@ check('no memory or plugin-manager rows are mounted', () => {
   for (const needle of ['meow-memory', 'plugin-manager']) {
     assert(!definition.plugins.some((row) => row.name.includes(needle)), `${needle} is mounted`)
   }
+})
+
+// ── required-without-fallback config ──────────────────────────────────────────
+//
+// These two rows declare their config fields as REQUIRED with no default. A row
+// that omits one fails the activation audit, and one failed row breaks the
+// entire preset: the Agent then exists but cannot be selected, with the reason
+// visible only in the preset's `broken` field. Version 1.x of this bundle
+// shipped that exact defect; `verify-runtime/run.mjs` is what caught it against
+// a live install, and these assertions are what keep it caught offline.
+console.log('')
+console.log('required config (a missing required field breaks the whole preset)')
+
+check('tool-fs-search carries the required sampleOverCapGlobResults', () => {
+  const row = definition.plugins.find((r) => r.name.includes('dsh-tool-fs-search'))
+  assert(row !== undefined, 'tool-fs-search row is missing')
+  assert(
+    row.config?.sampleOverCapGlobResults === false,
+    `sampleOverCapGlobResults = ${JSON.stringify(row.config?.sampleOverCapGlobResults)} (required, no default)`
+  )
+})
+check('tool-todo carries the required allowParallelInProgress', () => {
+  const row = definition.plugins.find((r) => r.name.includes('dsh-tool-todo'))
+  assert(row !== undefined, 'tool-todo row is missing')
+  assert(
+    row.config?.allowParallelInProgress === true,
+    `allowParallelInProgress = ${JSON.stringify(row.config?.allowParallelInProgress)} (required, no default)`
+  )
+})
+check('dropping the companion does not drop the required config with it', () => {
+  for (const name of ['dsh-tool-fs-search', 'dsh-tool-todo']) {
+    const row = gated.plugins.find((r) => r.name.includes(name))
+    assert(row !== undefined, `${name} is not mounted without the companion`)
+    assert(
+      typeof row.config === 'object' && row.config !== null && Object.keys(row.config).length > 0,
+      `${name} lost its required config without the companion`
+    )
+  }
+})
+check('the runtime harness is shipped so this class of defect stays catchable', () => {
+  const files = PKG.files ?? []
+  assert(files.includes('verify-runtime'), 'verify-runtime is not in the files whitelist')
 })
 
 // ── packaging ─────────────────────────────────────────────────────────────────

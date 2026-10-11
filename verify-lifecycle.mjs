@@ -86,9 +86,12 @@ check('apply() registers exactly one preset', () => {
 })
 check('the registered definition is the built one', () => {
   const got = happy.state.registered[0]
+  // `apply()` builds with the real resolvability probe, so the expectation must
+  // take the same default path: in a bare checkout the companion is absent, in
+  // an installed profile it is present, and the row count follows.
   const want = buildDefinition()
   assert(got.id === want.id, `id ${got.id} !== ${want.id}`)
-  assert(got.plugins.length === want.plugins.length, 'plugin row count differs')
+  assert(got.plugins.length === want.plugins.length, `plugin row count differs (${got.plugins.length} vs ${want.plugins.length})`)
   assert(got.plugins[0].config.prefix === want.plugins[0].config.prefix, 'spec text differs from buildDefinition()')
 })
 check('apply() registers an effect for teardown', () => {
