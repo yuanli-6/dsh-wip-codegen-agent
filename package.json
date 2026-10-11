@@ -1,0 +1,48 @@
+{
+  "name": "dsh-wip-codegen-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DSH bundle: registers the 'wip-codegen' Agent preset — a Java code-generation agent that follows the WIP/HRP team spec.",
+  "keywords": [
+    "dsh",
+    "dsh-bundle",
+    "dsh-plugin",
+    "agent-preset",
+    "deepseek-harness",
+    "codegen",
+    "spring-boot",
+    "mybatis-plus",
+    "wip"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "author": "yuanli-6",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yuanli-6/dsh-wip-codegen-agent.git"
+  },
+  "homepage": "https://github.com/yuanli-6/dsh-wip-codegen-agent#readme",
+  "bugs": {
+    "url": "https://github.com/yuanli-6/dsh-wip-codegen-agent/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "assets",
+    "verify.mjs",
+    "verify-lifecycle.mjs",
+    "check-patch.mjs",
+    "check-encoding.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

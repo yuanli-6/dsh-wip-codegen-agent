@@ -1,0 +1,9 @@
+# dsh-wip-codegen-agent patch: inserts this bundle's preset-declaring plugin
+# into the profile layer stack.
+#
+# The row's `name` is this package's name, so Node resolution finds the
+# installed (or linked) plugin code. Disable / remove this one row and the
+# `wip-codegen` Agent disappears again — that is the whole hot-plug story.
+- insert:
+    - id: dsh-wip-codegen-agent
+      name: 'dsh-wip-codegen-agent'
