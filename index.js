@@ -13,8 +13,15 @@
  * first-party way to say "this text is the whole system prompt". Without it
  * every profile-level plugin (memory guide, team policy, plan policy, tool
  * guidance) would also inject its own section, diluting a spec that is
- * deliberately prescriptive. With it, assembly still resolves variables and
- * still ships tool *schemas*, so `{{cwd}}` works and the tools remain callable.
+ * deliberately prescriptive. With it, assembly still resolves the variables
+ * the loop registers (`provider`, `model`) and still ships tool *schemas*, so
+ * the tools remain callable. It does NOT make arbitrary `{{…}}` names valid:
+ * an unregistered reference throws during assembly, before any model request.
+ *
+ * That is why the working directory is never restated here. It already reaches
+ * the model as *required* runtime context ("Current working directory: …"),
+ * which survives `complete: true`; restating it as `{{cwd}}` took the whole
+ * preset down with `unknown prompt variable "{{cwd}}"`.
  *
  * The prompt body is read from `assets/wip-codegen/system-prompt.md` at
  * activation, so that file stays the editable source of truth. Because the
@@ -74,12 +81,14 @@ const CATALOG_DESCRIPTION_MAX_LENGTH = 400
 /**
  * Appended to the spec as its own trailing block.
  *
- * The spec itself never says where the project lives, and under
- * `complete: true` no other section can supply that, so the agent would have
- * to guess a path before it could write a file. `{{cwd}}` is a harness
- * built-in prompt variable and resolves at render time.
+ * The spec itself never says where the project lives. Nothing is added for
+ * that on purpose: the harness working-directory service supplies the
+ * required "Current working directory: …" context on every step, including
+ * under `complete: true`, so a template variable would be both redundant and
+ * fatal — the loop registers only `provider` and `model`, and strict
+ * interpolation throws on anything else.
  *
- * The spec path is the second half of the same problem: §14.6 tells the agent
+ * The spec path is the remaining fact the agent cannot derive: §14.6 tells it
  * to append user-declared global rules to §十五 of *this* file, and the file
  * lives in the installed package, whose location the agent cannot guess.
  */
@@ -87,7 +96,6 @@ function trailingNotes() {
   return [
     '---',
     '',
-    '工作目录（当前项目根）：{{cwd}}',
     `规范正文路径（§十五 全局规则追加到该文件）：${fileURLToPath(SPEC_FILE_URL)}`
   ].join('\n')
 }

@@ -35,7 +35,7 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 预设里引用一个装不上的包会让整条预设激活失败（见「两个真实的坑」），所以插件会先探测
 `dsh-api-test-bundle` 是否可解析，解析不到就只记一条警告、不挂那两行。
 
-锁定版本：`github:yuanli-6/dsh-wip-codegen-agent#v2.0.0`。
+锁定版本：`github:yuanli-6/dsh-wip-codegen-agent#v2.0.1`。
 本地改代码时用目录安装：`action: install_bundle, target: <本目录绝对路径>`。
 
 装完**新开一个对话**，预设选择里就能看到 **WIP/HRP 代码生成**。
@@ -68,8 +68,15 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 
 `complete: true` 是平台第一方表达「这段就是完整系统提示词」的方式。含义是：
 **只有这份规范进上下文**，记忆导引、team 政策、plan 政策、其他插件的工具指引都不会再注入。
-规范本身是强制性的（"必须严格遵守"），稀释它没有好处。变量与工具 schema 照常解析，
-所以正文末尾注入的两行（`工作目录：{{cwd}}` 和**规范正文绝对路径**）能正确渲染，工具也照常可调用。
+规范本身是强制性的（"必须严格遵守"），稀释它没有好处。工具 schema 照常下发，
+工具也照常可调用。
+
+注意 `complete: true` **不会**让任意 `{{…}}` 名字变得合法：循环只注册 `provider` 与
+`model` 两个变量，任何其他引用都会让提示词组装直接抛 `unknown prompt variable`，
+这一轮的模型请求根本发不出去（表现为「本轮运行失败」）。所以正文末尾只注入
+**规范正文绝对路径**一行；工作目录由平台的工作目录服务以「必需」运行时上下文
+（`Current working directory: …`）提供，`complete: true` 也压不掉，既不需要、
+也不能再写成模板变量。
 
 > 规范正文路径那行是给 §14.6 用的：Agent 要把你提出的全局规则追加进正文 §十五，
 > 它必须知道那个文件在哪。路径由插件在激活时算出，不写死在任何地方。
@@ -95,6 +102,13 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 
 > v1.x 曾经刻意不给 `skill`（省 token）。v2.0.0 改了：既然是"把这个插件配置到这个 agent 里"，
 > 就必须有目录与加载工具，否则技能注册了也没人看得见。代价是一条技能描述（上限 400 字符）。
+
+> **v2.0.1 修的是 v2.0.0 的致命 bug**：正文末尾曾注入 `工作目录：{{cwd}}`，
+> 而平台的提示词循环只注册 `provider` / `model` 两个变量，于是每次模型请求都在
+> `deployment:persona-prefix` 段组装失败（`unknown prompt variable "{{cwd}}"`）。
+> 修法不是换变量名，而是**删掉那一行**：工作目录本来就由工作目录服务以必需运行时上下文
+> （`Current working directory: …`）下发，`complete: true` 压不掉它，重述一遍既多余又致命。
+> 用 v2.0.0 的请按「发布新版本」的三步升级。
 
 ### 两个必需的配置字段（别删）
 
@@ -191,19 +205,28 @@ node verify-runtime/run.mjs --from-github   # 改成从 GitHub 装（发布后�
 2. 装本插件 + 测试插件（**先 remove 再 add**，理由见下）；
 3. 用 `--patch` 挂一个只读探针，启动后读取**真实装配结果**：预设是否 `broken`、每行插件的
    `fiberState`、预设作用域内的技能目录、`api-test` 正文是否带新规则、
-   persona 会不会拿到正文与注入路径；
+   persona 会不会拿到正文与注入路径；并在预设作用域里**真跑一次提示词组装与渲染**
+   （`systemPrompt.assemble()` + `renderPrompt()`），把组装异常原样报回来；
 4. 断言完把临时 `DSH_HOME` 删掉（`--keep` 可保留排查）。
 
-**不调用模型、不需要账号**：探针读完就 `process.exit(0)`。
+**不调用模型、不需要账号**：探针读完就 `process.exit(0)`——它只是把模型请求之前的那一步跑掉。
 
 ### 为什么需要一个运行时自检
 
-因为下面两个真实的坑，离线自检一个都发现不了：
+因为下面三个真实的坑，离线自检（以及"装上了、能选中预设"）都发现不了：
 
 1. **必填配置**：行配置缺必填字段 → 整条预设 `broken`，Agent 选都选不了（v1.x 的真实状态）；
 2. **pnpm 复用**：`file:` 依赖的 spec 没变时，`add` 会直接复用 store 里的旧副本——
    于是"明明改了代码，测出来的还是旧行为"。runner 因此改成**先 remove 再 add**，
-   并额外比对装入副本与工作树的哈希，证明测的是同一份代码。
+   并额外比对装入副本与工作树的哈希，证明测的是同一份代码；
+3. **未注册的提示词变量**：预设能装上、能被选中、行也全部 `ACTIVE`，但正文里写了
+   `{{cwd}}` 这类平台不注册的名字，于是**每一次**模型请求都在提示词组装阶段抛
+   `unknown prompt variable … in section "deployment:persona-prefix"`（UI 上就是「本轮运行失败」）。
+   v2.0.0 正是栽在这里。探针现在会读 `probe.assembly`：在预设作用域里真跑一次
+   `systemPrompt.assemble()` + `renderPrompt()`，只要组装抛错就报 `assemblyError`。
+
+> 第 3 条的教训：**"预设不 broken"不等于"能用"**。前者只覆盖激活审计，后者才覆盖提示词渲染——
+> 这是两条独立的失败路径，运行时要分别验。
 
 ---
 

@@ -274,6 +274,32 @@ if (start === -1 || end === -1) {
   })
 
   console.log('')
+  console.log('prompt assembly (what the first model request would do)')
+  const assembly = observation.assembly ?? {}
+  check('prompt assembly does not throw', () => {
+    assert(!assembly.assemblyError, `assemble() failed: ${String(assembly.assemblyError)}`)
+  })
+  check('every referenced prompt variable is registered by the loop', () => {
+    const unknown = assembly.unknownVariables ?? []
+    assert(
+      unknown.length === 0,
+      `unregistered variable(s) ${unknown.join(', ')} — renderPrompt() would throw on every model request ` +
+        `(registered: ${String(assembly.variableNames)})`
+    )
+  })
+  check('every registered variable has a value for this assembly', () => {
+    const valueless = assembly.valuelessVariables ?? []
+    assert(valueless.length === 0, `valueless variable(s) ${valueless.join(', ')}`)
+  })
+  check('the persona section is present and non-empty', () => {
+    assert(assembly.personaChars > 5000, `deployment:persona-prefix carries ${String(assembly.personaChars)} chars`)
+  })
+  check('the persona is the complete prompt, without a rival', () => {
+    const complete = (assembly.sectionNames ?? []).length === 1
+    assert(complete, `complete:true expects one effective section, got ${JSON.stringify(assembly.sectionNames)}`)
+  })
+
+  console.log('')
   console.log('spec text carried by the persona')
   check('the installed bundle reports its own definition', () => {
     assert(!observation.bundle?.error, String(observation.bundle?.error))

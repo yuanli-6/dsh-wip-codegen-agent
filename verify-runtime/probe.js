@@ -68,6 +68,9 @@ async function observe(ctx) {
     return observation
   }
 
+  // Before anything else: would a model request get past prompt assembly?
+  observation.assembly = await observeAssembly(ctx, observation.presetId)
+
   observation.composition = {
     id: composition.id,
     name: composition.name,
@@ -154,6 +157,66 @@ async function observe(ctx) {
   }
 
   return observation
+}
+
+/**
+ * Run the preset's prompt assembly and check what `renderPrompt()` would reject.
+ *
+ * This is the step the other observations miss. A preset can be mounted, every
+ * row ACTIVE, and still be unusable: `renderPrompt()` interpolates `{{name}}`
+ * strictly, so a section that references a variable the loop never registered
+ * throws on *every* model request — "unknown prompt variable ... in section
+ * deployment:persona-prefix" — while nothing about the composition looks wrong.
+ * v2.0.0 shipped exactly that and nobody noticed until a session was started.
+ *
+ * The renderer itself lives in `@deepseek-ai/dsh-system-prompt`, which a profile
+ * plugin cannot import by bare name, so the rule is re-applied here: every
+ * `{{name}}` in an interpolating section must be a registered variable, and its
+ * value must not be `undefined`.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx - probe context.
+ * @param {string} presetId - preset to assemble.
+ * @returns {Promise<object>} the assembly observation, JSON-serializable.
+ */
+async function observeAssembly(ctx, presetId) {
+  const prompt = ctx.get('systemPrompt')
+  if (prompt === undefined) return { error: 'ctx.systemPrompt is not available in this profile' }
+
+  let lease
+  try {
+    lease = await ctx.agentPresets.acquireScope(presetId)
+    const assembly = await prompt.assemble({ scope: lease.key })
+    const persona = assembly.sections.find((section) => section.name === 'deployment:persona-prefix')
+
+    const unknowns = []
+    const valueless = []
+    for (const section of assembly.sections) {
+      if (section.interpolate === false) continue
+      for (const match of section.text.matchAll(/\{\{([^{}]*)\}\}/g)) {
+        const variable = match[1]
+        if (!Object.hasOwn(assembly.variables, variable)) unknowns.push(`${section.name}:{{${variable}}}`)
+        else if (assembly.variables[variable] === undefined) valueless.push(`${section.name}:{{${variable}}}`)
+      }
+    }
+
+    return {
+      ok: unknowns.length === 0 && valueless.length === 0,
+      sectionNames: assembly.sections.map((section) => section.name),
+      variableNames: Object.keys(assembly.variables),
+      personaChars: typeof persona?.text === 'string' ? persona.text.length : null,
+      personaInterpolates: persona === undefined ? null : persona.interpolate !== false,
+      unknownVariables: unknowns,
+      valuelessVariables: valueless
+    }
+  } catch (error) {
+    return { ok: false, assemblyError: String(error?.message ?? error) }
+  } finally {
+    try {
+      await lease?.[Symbol.asyncDispose]?.()
+    } catch {
+      // A lease that refuses to release must not hide the result.
+    }
+  }
 }
 
 /**

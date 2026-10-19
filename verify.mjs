@@ -178,12 +178,25 @@ check('persona prefix starts with the spec verbatim', () => {
 check('persona prefix is the spec plus only the trailing notes', () => {
   const expected = rawSpec.replace(/^\uFEFF/, '').trim()
   const extra = persona.config.prefix.slice(expected.length)
-  assert(extra.includes('{{cwd}}'), 'the working-directory note is missing, so the agent cannot find a path to write to')
   assert(
     extra.includes('system-prompt.md'),
     'the spec-path note is missing, so §14.6 has no file to append global rules to'
   )
   assert(extra.length < 400, `unexpected extra prose after the spec (${extra.length} chars)`)
+})
+check('persona references only prompt variables the loop registers', () => {
+  // The agent loop registers exactly `provider` and `model`; renderPrompt()
+  // throws on any other reference, which fails every model request in the
+  // session ("unknown prompt variable … in section deployment:persona-prefix").
+  // 2.0.0 shipped `{{cwd}}` here and took the whole preset down. The working
+  // directory already arrives as required runtime context, so nothing is owed.
+  const registered = new Set(['provider', 'model'])
+  const referenced = [...persona.config.prefix.matchAll(/\{\{([a-z][a-z0-9_]*)\}\}/g)].map((m) => m[1])
+  const unknown = [...new Set(referenced)].filter((variable) => !registered.has(variable))
+  assert(
+    unknown.length === 0,
+    `unregistered prompt variable(s) ${unknown.join(', ')} — assembly throws before the first model request`
+  )
 })
 check('no fallback body was served', () => {
   assert(!persona.config.prefix.includes('规范正文未能读取'), 'the asset failed to load during this check')
