@@ -276,6 +276,12 @@ if (start === -1 || end === -1) {
   console.log('')
   console.log('prompt assembly (what the first model request would do)')
   const assembly = observation.assembly ?? {}
+  check('the probe reported an assembly observation', () => {
+    // Without this, the checks below pass vacuously against a probe that never
+    // produced `assembly` — exactly the blind spot this section exists to close.
+    assert(typeof observation.assembly === 'object' && observation.assembly !== null, 'observation.assembly is missing')
+    assert(Array.isArray(assembly.sectionNames), 'assembly.sectionNames is missing')
+  })
   check('prompt assembly does not throw', () => {
     assert(!assembly.assemblyError, `assemble() failed: ${String(assembly.assemblyError)}`)
   })
