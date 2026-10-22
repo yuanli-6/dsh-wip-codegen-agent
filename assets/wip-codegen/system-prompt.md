@@ -95,9 +95,9 @@
 ### 3.4 导入/导出对象
 
 - 实现 `Serializable`
-- `@ExcelImport("列名")` / `@ExcelExport(value = "列名", kv = "0:xx;1:xx", dateformat = "yyyy-MM-dd")`
-- 导出对象序号列：`@ExcelExport(value = "序号") private Integer rowNum;`
-- 字典字段用 `kv` 映射中文
+- `@ExcelImport("列名")` / `@ExcelExport(value = "列名", kv = "0-xx;1-xx", dateformat = "yyyy-MM-dd")`
+- **导出列以用户提供的列表字段为准**：用户未明确要求「序号」时，不声明 `rowNum`、不加序号列
+- **字典字段必须写 `kv`**，格式 `0-中文;1-中文`（半角短横线 + 分号，**不是 `0:中文`**）；kv 中文取自 SQL 注释 / 实体 `@Schema` / 既有代码口径，不得自行编造
 
 ---
 
@@ -155,17 +155,42 @@
 
 ## 七、字段命名与业务规则
 
-| 业务字段 | Java 字段名 | 说明 |
-|----------|-------------|------|
-| 员工工号 | `userName` / `staffNo` / `wbsNum` | 按表结构选择 |
-| 员工姓名 | `nikeName` | 不是 nickName |
-| 工区 | `workArea` | |
-| 班组 | `teamName` | |
-| 日期 | `taskDate` | |
-| 时段 | `timePeriod` | 0:上半天, 1:下半天 |
-| 工作日历 | `calendarType` | 0:工作日, 1:双休日, 2:节假日 |
-| 逻辑删除 | `isDelete` | |
-| 状态字段 | `xxxStatus` | |
+**命名一致性铁律**：不同表中**含义相同**的字段，列名与 Java 属性名必须**完全一致**，禁止同义异名。
+
+建新表或给既有表补字段前，先检索既有实体类 / Mapper XML / 建表脚本，判断该字段在系统里的既有口径：
+
+| 检索结果 | 处理方式 |
+|----------|----------|
+| **全系统只有一种含义、一种命名** | **直接沿用，不用问用户** |
+| **同义多名**（同一含义存在多个列名，如工号有 `user_name` / `wbs_num` / `staff_no`） | **先找用户确认**用哪一个，确认后再落地 |
+| **一名多义**（同一列名在不同表含义不同，如 `wbs_num` 既表制造单号又表工号） | **先找用户确认**本表该用哪个语义，确认后再落地 |
+
+**判断顺序：能确定唯一口径的，直接沿用；确定不了或有冲突的，停下来问。** 严禁自行拍板统一方案，也严禁明知冲突却新起一个名字。
+
+| 业务字段 | 列名 | Java 字段名 | 说明 |
+|----------|------|-------------|------|
+| 员工工号 | `user_name` | `userName` | 考勤/人员维度统一用这个 |
+| 员工姓名 | `nike_name` | `nikeName` | 不是 nickName |
+| 工区 | `work_area` | `workArea` | |
+| 班组 | `team_name` | `teamName` | |
+| 日期 | `task_date` | `taskDate` | |
+| 时段 | `time_period` | `timePeriod` | 0:上半天, 1:下半天 |
+| 工作日历 | `calendar_type` | `calendarType` | 0:工作日, 1:双休日, 2:节假日 |
+| 异常情况说明 | `exception_description` | `exceptionDescription` | 全系统统一 |
+| 附件 | `attachment_ids` | `attachmentIds` | 全系统统一，多个逗号隔开 |
+| 逻辑删除 | `is_delete` | `isDelete` | |
+| 状态字段 | 表描述英文 + `_status` | 表描述英文 + `Status` | 如 `overtime_apply_status`；细分状态（如 `exception_handle_status`）沿用字段级命名 |
+
+**`wbs_num` / `wbsNum` 是历史遗留的「一列多义」，用之前必须先查代码上下文：**
+
+| 语义 | 出现范围 | 说明 |
+|------|----------|------|
+| **制造单号** | `wip_order`、`wip_product`、`wip_milestone`、`wip_activity_info` 等**在制品/物料维度**表 | `wbs_num` 的原始含义，SAP 制造单号 |
+| **工号** | `wip_task_arrangement`、`wip_doc_distribution(_team)`、`wip_demand_node`、`wip_unconventional_task`、`wip_team_task_delegation` 等**人员维度**表 | 历史误用，本应是工号 |
+
+判断方法：看该表面向的业务维度 —— **人员/考勤维度**（面对人）工号用 `user_name` / `userName`；**在制品/物料维度**（面对产品）`wbs_num` / `wbsNum` = 制造单号。
+
+**遇到 `wbs_num` 且上下文不足以判断语义时（例如只有字段清单、看不到业务描述），必须先问用户，不得自行猜测。** 新表的人员工号一律用 `user_name`；既有表的历史误用不改动，仅在回复中指出。
 
 ### 7.1 常用字典值
 
@@ -612,4 +637,12 @@ GO
 > 本区由 Agent 在会话中按 §14.6 追加。**每条规则都需要用户确认过措辞**；重装本插件会覆盖整个正文文件，升级前先把本区内容备份出来。
 
 <!-- 追加格式：- [yyyy-MM-dd][场景] 规则正文 -->
+
+- [2026-10-15][导出] 导出列以用户提供的列表字段为准。用户未明确要求「序号」时，导出类不声明 `rowNum`，也不加序号列。
+- [2026-10-15][导出] 导出类中的字典字段必须用 `@ExcelExport` 的 `kv` 映射中文，格式为 `0-中文;1-中文`（键值之间用半角短横线 `-`，多条用分号 `;` 分隔，**不要写成 `0:中文`**）。kv 的中文一律取自 SQL 字段注释、实体 `@Schema` 描述或系统既有代码的既有口径，不得自行编造。
+- [2026-10-15][建表] 表的主状态字段命名 = 表描述英文 + `_status`（如 `overtime_apply_status`、`flexible_shift_apply_status`）；同表内的细分状态沿用字段级命名（如 `exception_handle_status`）。
+- [2026-10-15][建表] 字段清单必须先结合系统既有代码推导（前置/后置业务逻辑、已有关联实体、既有连表口径）：**能通过关联表查询出来的字段不建列**；业务确实需要而清单缺失的字段主动提出补充。字段清单必须先经用户逐个确认，确认通过前不得写建表脚本文件、不得生成下游 Java 代码。
+- [2026-10-15][用户信息] 用户信息统一使用 `com.dq.wip.domain.dto.UserDTO`（`userName` / `nickName`）。当 `UserDTO` 字段不足以承载业务所需信息时，**先询问用户如何处理**（是否扩字段、换用哪个类、或额外查用户服务），不得自行扩展该类或改用其他类。
+- [2026-10-16][建表] **不同表中含义相同的字段，列名与 Java 属性名必须完全一致，禁止同义异名。** 建新表或给既有表补字段前，先检索既有实体类 / Mapper XML / 建表脚本：**若该字段全系统只有一种含义、一种命名，直接沿用，不用问用户；若存在同义多名或一名多义，必须先找用户确认用哪个，确认后再落地**，不得自行拍板、也不得另起一个名字。
+- [2026-10-16][建表] **`wbs_num` / `wbsNum` 是历史遗留的「一列多义」，用之前必须查代码上下文**：在制品/物料维度（`wip_order`、`wip_product`、`wip_milestone`、`wip_activity_info` 等）它是**制造单号**；人员维度（`wip_task_arrangement`、`wip_doc_distribution(_team)`、`wip_demand_node`、`wip_unconventional_task`、`wip_team_task_delegation` 等）被历史性误用为**工号**。**上下文不足以判断语义时（如只有字段清单），先问用户，不得自行猜测。** 新表的人员工号一律用 `user_name` / `userName`；既有表的历史误用不改动，仅在回复中指出。
 
