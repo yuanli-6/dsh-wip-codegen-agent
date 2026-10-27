@@ -645,4 +645,71 @@ GO
 - [2026-10-15][用户信息] 用户信息统一使用 `com.dq.wip.domain.dto.UserDTO`（`userName` / `nickName`）。当 `UserDTO` 字段不足以承载业务所需信息时，**先询问用户如何处理**（是否扩字段、换用哪个类、或额外查用户服务），不得自行扩展该类或改用其他类。
 - [2026-10-16][建表] **不同表中含义相同的字段，列名与 Java 属性名必须完全一致，禁止同义异名。** 建新表或给既有表补字段前，先检索既有实体类 / Mapper XML / 建表脚本：**若该字段全系统只有一种含义、一种命名，直接沿用，不用问用户；若存在同义多名或一名多义，必须先找用户确认用哪个，确认后再落地**，不得自行拍板、也不得另起一个名字。
 - [2026-10-16][建表] **`wbs_num` / `wbsNum` 是历史遗留的「一列多义」，用之前必须查代码上下文**：在制品/物料维度（`wip_order`、`wip_product`、`wip_milestone`、`wip_activity_info` 等）它是**制造单号**；人员维度（`wip_task_arrangement`、`wip_doc_distribution(_team)`、`wip_demand_node`、`wip_unconventional_task`、`wip_team_task_delegation` 等）被历史性误用为**工号**。**上下文不足以判断语义时（如只有字段清单），先问用户，不得自行猜测。** 新表的人员工号一律用 `user_name` / `userName`；既有表的历史误用不改动，仅在回复中指出。
+- [2026-10-27][风格] **能用 stream 链式解决的逻辑一律用 stream**：不要建临时集合再逐个 add；分组用 `Collectors.groupingBy` 一次建 Map 后 `forEach` 取 O(1)；最值/去重用 `min`/`max`/`distinct`；嵌套集合用 `flatMap(Collection::stream)` 展平。lambda 写 `n->`（箭头前不空格）。
+- [2026-10-27][风格] **严禁擅自格式化用户既有代码。** 大括号位置、逗号空格、lambda 箭头空格、`implements XxxService{` 写法、javadoc 星号空格、import 通配/展开、常量引用改写——一律保持原样。只改本次要求改的部分，范围外的既有方法一行不动。
+- [2026-10-27][结构] **不要为一个小功能新建类。** 对外接口写在对应业务的 Controller 里（如人员出勤的对外接口写进 `WipTeamAttendanceController`）；需要常量时集中建一个业务常量类（`public class` + `public static final` + 单行 javadoc，字典类常量用 `Integer`），不要在 Impl 里堆 `private static final`。
+- [2026-10-27][流程] **新建类与删除类、字段、方法同等对待，都必须先经用户确认。** 不得因为"顺手"就新建一个 util、rep、service 或 controller；先说明要建什么、放哪个包、为什么不能复用既有类，拿到确认后再写。
 
+---
+
+## 十六、项目知识摘要（会话沉淀）
+
+> 本区记录在 wip-srv / hrp-srv 实际开发中踩过的坑与既定口径，供后续会话直接复用。
+
+### 16.1 编译与验证
+
+- **Maven 不可用**：`mvn` 不在 PATH、无 `mvnw.cmd`、私服 `http://192.168.110.220:8081` 超时。唯一可用方式是 `javac -encoding UTF-8 -nowarn -d <out> -cp "<cp2.txt 内容>" @<argfile>`，classpath 取自 `C:\Users\GSH\AppData\Local\Temp\wipbuild\cp2.txt`（269 条真实依赖）。
+- 编译四个必须遵守的点：
+  1. 必须带 `-encoding UTF-8`；
+  2. 抓 stderr 用 `ProcessStartInfo` + `StandardErrorEncoding = GetEncoding(936)`，否则中文报错乱码；
+  3. `@argfile` 路径必须用正斜杠，且文件必须无 BOM（`[System.IO.File]::WriteAllText($f, $s, (New-Object System.Text.UTF8Encoding($false)))`）；
+  4. **不要加 `-proc:none`**，关掉 lombok 会误报大量「找不到符号」。
+- **被引用的实体 / Mapper 必须一并放进源文件列表**，否则 javac 会静默加载 `target\classes` 里的旧 class，编译假绿、运行时才发现字段不存在。
+- **源码删类后必须同时删 `target\classes` 下对应 `.class`**，否则旧类型继续参与编译，掩盖真实报错。
+- 全模块 1168 个文件一次编译会超 120s 超时，只能定向编译改动涉及的类。
+
+### 16.2 文件换行与写文件
+
+- `wip-service` 下**既有 Java 多为 CRLF**，但**新建文件常是 LF**；`docs/*.sql`、`AttSyncMapper.xml` 是 LF。改文件前先探测 `([regex]::Matches($c,"`r`n")).Count`，按实际换行构造待匹配串，否则 `$c.Contains($old)` 恒为 false 报「未匹配」。
+- 写文件统一 `[System.IO.File]::WriteAllText($p, $c, (New-Object System.Text.UTF8Encoding($false)))`，避免 BOM 与编码问题。
+- `edit` 工具易报 `file changed since it was read`，批量替换用 `ReadAllText` + `Replace` + `WriteAllText` 更稳。
+
+### 16.3 MyBatis-Plus 自动填充
+
+- `MyBatisPlusHandler.insertFill` 用反射调 `setIsNull()`，失败抛 `BaseException("插入数据失败--后端管理的创建时间没有重置成功")`。
+- ⇒ **不继承 `BaseDataEntity` 的实体不能走 `baseMapper.insert()`**，必须写自定义 `<insert>` SQL 绕开自动填充（`AttSync` 就是这种，41 个 `implements Serializable` 的实体同理）。
+- 审计字段写库走 `userName()` / `nikeName()`（`HttpServletRequestUtils`）；定时任务里需 `initRequest("admin", "系统", Runnable)` 包一层，否则取不到操作人（`getRequestUserName()` catch 空块返回 null，不会 NPE）。
+
+### 16.4 多数据源
+
+- 项目自带 `DruidConfig` / `DynamicDataSource`，但 `DataSourceType` 只有 MASTER/SLAVE 且**全项目零调用**，是摆设。
+- 自建 `com.dq.wip.config.annotation.DataSource` + `DataSourceAspect`（`@Order(Ordered.HIGHEST_PRECEDENCE)`），新增数据源在 `DruidConfig` 加 `@ConditionalOnProperty(prefix = "spring.datasource.druid.zkteco", name = "enabled", havingValue = "true")` 的 bean。
+- 上游读写抽成独立 Service 并**在类级别**标注 `@DataSource`：同类自调用不过代理，注解会失效。
+- **刻意不加事务**：事务会把连接绑定到线程，导致后续数据源切换失效。`DruidConfig.setDataSource` 的 catch 是空块，未配置数据源不会导致启动失败。
+
+### 16.5 Quartz 定时任务
+
+- `TaskUtils.invokeMethod` 用 `clazz.getDeclaredMethod(methodName, String.class)` ⇒ **定时任务方法签名必须是单个 String 入参**。
+- 常量四件套集中在 `com.dq.wip.domain.constant.QuartzJobConstant`（interface），`defaultStartJob()` 里 `list.add(new QuartzJobCreateReq(NAME, BEAN, METHOD, CRON, StrUtil.EMPTY))`。
+
+### 16.6 日期格式注解
+
+- **日期字段统一用 `@JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss", timezone = "GMT+8")`**（纯日期用 `yyyy-MM-dd`），与项目既有 Resp/Req 口径一致。
+- 项目无全局日期转换：`DateFormatForJson` 只作用于 `MappingJackson2HttpMessageConverter` 的 JSON 序列化/反序列化；`@RequestParam` 声明为 `Date` 时仍需 `@DateTimeFormat(pattern = "yyyy-MM-dd HH:mm:ss")` 才能绑定，否则 400。
+
+### 16.7 注解差异（wip 与 hrp）
+
+- wip 侧 `com.dq.wip.config.annotation.ConcurrencyLock` **只有 `long value() default 30L`，没有 `rateLimit()`**；hrp 侧有。照抄 hrp 的 `@ConcurrencyLock(value = 1800L, rateLimit = 30)` 会编译失败。
+
+### 16.8 空值口径
+
+- `exceptionSituation` 正常出勤写**空字符串而不是 null**：`updateBatchById` 默认 `NOT_NULL` 策略，写 null 不进 SQL，状态从「迟到」重算回「正常」时旧文本清不掉。
+
+### 16.9 考勤判定口径
+
+- 上下班都打齐 ⇒ **当场判状态**，不必等下班有效期过去；
+- 只打了一半且下班有效期未过 ⇒ **只回填打卡时间**，状态交给「打卡已失效」那一步；
+- 下班有效期已过仍未打齐 ⇒ 判缺勤。
+- 上班卡取窗口内**最早**一次、下班卡取窗口内**最晚**一次；窗口 = 申请时间 ± 班次的有效分钟（`workBefore` / `workAfter` / `workLeaveBefore` / `workLeaveAfter`）。
+- 时间比较用「同一分钟」而非 `equals`：上游 `checktime` 是 `datetime`（精度 3.33ms），读回毫秒数会变，直接 `equals` 会每轮重复 UPDATE。
+- 到期条件写在 SQL 里（对 `now` 运算而非对列做函数），避免索引失效。
