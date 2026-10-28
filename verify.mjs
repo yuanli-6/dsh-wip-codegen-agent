@@ -102,6 +102,17 @@ check('spec exposes an append target for global rules', () => {
 // ── the definition handed to agentPresets.register() ──────────────────────────
 const { buildDefinition, companionAvailable, name: pluginName, inject } = await import('./index.js')
 
+// The persona row is this bundle's own module; importing it here is what lets
+// the prompt body be asserted without standing up a DSH host. It has no harness
+// dependency on purpose, so this import stays valid on a bare checkout.
+const { readSpecBody } = await import('./persona-hot.js')
+
+/** The row name `index.js` must use for the persona. */
+const PERSONA_ROW = 'dsh-wip-codegen-agent/persona-hot'
+
+/** The body the persona row serves right now. */
+const personaBody = readSpecBody((message) => warnings.push(message))
+
 // Rows are asserted against the *intended* shape (companion present); the
 // resolvability gate itself is exercised in its own section below.
 const definition = buildDefinition((message) => warnings.push(message), { apiTest: true })
@@ -139,12 +150,12 @@ check('every row is a well-formed entry', () => {
     assert(typeof row.name === 'string' && row.name.length > 0, `row ${row.id} has no name`)
   }
 })
-check('every row names either a first-party harness package or the declared companion', () => {
+check('every row names a first-party package, the companion, or this bundle own persona', () => {
   for (const row of definition.plugins) {
     const firstParty = row.name.startsWith('@deepseek-ai/dsh-')
     assert(
-      firstParty || row.name === 'dsh-api-test-bundle',
-      `row ${row.id} names "${row.name}", which is neither first-party nor the companion`
+      firstParty || row.name === 'dsh-api-test-bundle' || row.name === PERSONA_ROW,
+      `row ${row.id} names "${row.name}", which is neither first-party, the companion, nor ${PERSONA_ROW}`
     )
   }
 })
@@ -153,31 +164,62 @@ check('row ids are unique', () => {
   assert(new Set(ids).size === ids.length, `duplicate ids in ${ids.join(', ')}`)
 })
 check('exactly one persona row exists', () => {
-  const personaRows = definition.plugins.filter((row) => row.name.includes('dsh-persona'))
-  assert(personaRows.length === 1, `found ${personaRows.length} persona rows`)
+  const personaRows = definition.plugins.filter((row) => row.name === PERSONA_ROW)
+  assert(personaRows.length === 1, `found ${personaRows.length} persona rows named ${PERSONA_ROW}`)
 })
 
 // ── the persona carries the whole spec ────────────────────────────────────────
-const persona = definition.plugins.find((row) => row.name.includes('dsh-persona'))
+const persona = definition.plugins.find((row) => row.name === PERSONA_ROW)
 
 console.log('')
 console.log('persona (the system prompt)')
-check('persona is not disabled', () => {
+check('persona is this bundle own hot-reloading row', () => {
+  assert(persona !== undefined, `no row named ${PERSONA_ROW}`)
   assert(persona.disabled !== true, 'the persona row is disabled, so the spec would never load')
 })
-check('persona uses complete:true (spec becomes the whole system prompt)', () => {
-  assert(persona.config?.complete === true, 'complete is not true — profile sections would dilute the spec')
+check('persona does NOT use @deepseek-ai/dsh-persona (its body would freeze at mount)', () => {
+  // `dsh-persona` takes the body as a row-config string and preset configs are
+  // structuredClone'd at mount, so editing the asset would change nothing until
+  // a reinstall. The shipped row exists to remove exactly that.
+  assert(
+    !definition.plugins.some((row) => row.name === '@deepseek-ai/dsh-persona'),
+    'the static persona row is back — the spec would no longer hot-reload'
+  )
 })
-check('persona prefix starts with the spec verbatim', () => {
+check('persona row carries the served character count as a diagnostic', () => {
+  const count = persona.config?.specCharacters
+  assert(Number.isInteger(count) && count > 5000, `specCharacters = ${JSON.stringify(count)}`)
+})
+check('persona row config holds no prompt body (it must re-read the file)', () => {
+  const serialized = JSON.stringify(persona.config ?? {})
+  assert(
+    !serialized.includes('WIP/HRP'),
+    'a prompt body was frozen into the row config — structuredClone would pin it to mount time'
+  )
+})
+check('the persona module registers the deployment persona section', () => {
+  const source = readFileSync(new URL('./persona-hot.js', import.meta.url), 'utf8')
+  assert(source.includes("'deployment:persona-prefix'"), 'the section name drifted; the row would not shadow the deployment persona')
+  assert(source.includes('getSectionOrder('), 'the section order is not read from the registry')
+})
+check('the persona module keeps complete:true and a function body', () => {
+  // Both halves are load-bearing: `complete: true` makes the spec the whole
+  // system prompt, and a *function* `text` is the only thing the registry
+  // re-resolves per assembly. A plain string here silently re-freezes the spec.
+  const source = readFileSync(new URL('./persona-hot.js', import.meta.url), 'utf8')
+  assert(/complete:\s*true/.test(source), 'complete: true is gone — profile sections would dilute the spec')
+  assert(/text:\s*\(\s*\)\s*=>/.test(source), 'the section text is not a function — the spec would freeze at activation')
+})
+check('persona body starts with the spec verbatim', () => {
   const expected = rawSpec.replace(/^\uFEFF/, '').trim()
   assert(
-    persona.config.prefix.startsWith(expected),
+    personaBody.startsWith(expected),
     'the prompt does not begin with the spec — the asset may have been mangled or replaced by a fallback'
   )
 })
-check('persona prefix is the spec plus only the trailing notes', () => {
+check('persona body is the spec plus only the trailing notes', () => {
   const expected = rawSpec.replace(/^\uFEFF/, '').trim()
-  const extra = persona.config.prefix.slice(expected.length)
+  const extra = personaBody.slice(expected.length)
   assert(
     extra.includes('system-prompt.md'),
     'the spec-path note is missing, so §14.6 has no file to append global rules to'
@@ -191,7 +233,7 @@ check('persona references only prompt variables the loop registers', () => {
   // 2.0.0 shipped `{{cwd}}` here and took the whole preset down. The working
   // directory already arrives as required runtime context, so nothing is owed.
   const registered = new Set(['provider', 'model'])
-  const referenced = [...persona.config.prefix.matchAll(/\{\{([a-z][a-z0-9_]*)\}\}/g)].map((m) => m[1])
+  const referenced = [...personaBody.matchAll(/\{\{([a-z][a-z0-9_]*)\}\}/g)].map((m) => m[1])
   const unknown = [...new Set(referenced)].filter((variable) => !registered.has(variable))
   assert(
     unknown.length === 0,
@@ -199,7 +241,7 @@ check('persona references only prompt variables the loop registers', () => {
   )
 })
 check('no fallback body was served', () => {
-  assert(!persona.config.prefix.includes('规范正文未能读取'), 'the asset failed to load during this check')
+  assert(!personaBody.includes('规范正文未能读取'), 'the asset failed to load during this check')
 })
 
 // ── the tool surface ──────────────────────────────────────────────────────────
@@ -260,7 +302,7 @@ check('with the companion absent the two skill rows are dropped', () => {
 })
 check('with the companion absent the Agent still mounts its core rows', () => {
   const names = gated.plugins.map((r) => r.name)
-  for (const needle of ['dsh-persona', 'dsh-tool-fs', 'dsh-tool-fs-search', 'dsh-tool-ask-user', 'dsh-tool-todo']) {
+  for (const needle of [PERSONA_ROW, 'dsh-tool-fs', 'dsh-tool-fs-search', 'dsh-tool-ask-user', 'dsh-tool-todo']) {
     assert(names.some((n) => n.includes(needle)), `core row ${needle} was dropped too`)
   }
   const shells = names.filter((n) => n.includes('tool-pwsh') || n.includes('tool-bash'))
@@ -282,8 +324,8 @@ check('the real probe is a boolean and the definition is deterministic', () => {
 check('the persona is identical with and without the companion', () => {
   const withRows = buildDefinition(undefined, { apiTest: true })
   const without = buildDefinition(undefined, { apiTest: false })
-  const prefixOf = (d) => d.plugins.find((r) => r.name.includes('dsh-persona')).config.prefix
-  assert(prefixOf(withRows) === prefixOf(without), 'the spec text changed with the companion gate')
+  const specOf = (d) => d.plugins.find((r) => r.name === PERSONA_ROW).config.specCharacters
+  assert(specOf(withRows) === specOf(without), 'the spec text changed with the companion gate')
 })
 check('no delegation or workflow rows are mounted', () => {
   for (const needle of ['dsh-tool-subagent', 'dsh-tool-workflow', 'dsh-tool-ralph']) {
@@ -350,6 +392,19 @@ check('the spec asset is covered by the files whitelist', () => {
 })
 check('the plugin entry is covered by the files whitelist', () => {
   assert(files.includes('index.js'), 'index.js is not in files')
+})
+check('the persona row module is shipped and exported as a subpath', () => {
+  assert(files.includes('persona-hot.js'), 'persona-hot.js is not in files — the preset row could not import')
+  assert(
+    PKG.exports?.['./persona-hot'] === './persona-hot.js',
+    'exports["./persona-hot"] is missing — the row name would not resolve at mount'
+  )
+})
+check('the persona row name matches the exported subpath', () => {
+  assert(
+    PERSONA_ROW === `${PKG.name}/persona-hot`,
+    `row name ${PERSONA_ROW} does not match package name ${PKG.name}`
+  )
 })
 check('the patch file is covered by the files whitelist', () => {
   assert(files.includes('cordis.patch.yml'), 'cordis.patch.yml is not in files')

@@ -67,6 +67,18 @@ const SPEC_FILE_URL = new URL('./assets/wip-codegen/system-prompt.md', import.me
 const COMPANION_PACKAGE = 'dsh-api-test-bundle'
 
 /**
+ * The persona row this bundle ships itself.
+ *
+ * Not `@deepseek-ai/dsh-persona`: that row takes the body as a config string,
+ * and preset configs are cloned at mount, so the spec would freeze at
+ * activation. `./persona-hot.js` owns the same section name with a function
+ * body instead, which is what lets the file be re-read without a reinstall.
+ * A subpath rather than a file URL so the row resolves through the same
+ * `exports` map the host loader uses.
+ */
+const PERSONA_HOT_PACKAGE = 'dsh-wip-codegen-agent/persona-hot'
+
+/**
  * Name of the row that renders the skill catalog and the `skill` tool.
  *
  * The testing companion only *registers* a skill; without this consumer nothing
@@ -98,6 +110,33 @@ function trailingNotes() {
     '',
     `规范正文路径（§十五 全局规则追加到该文件）：${fileURLToPath(SPEC_FILE_URL)}`
   ].join('\n')
+}
+
+/**
+ * Absolute path of the spec asset.
+ *
+ * Resolved from this module's own URL, so it names the file the running install
+ * actually serves. `persona-hot` watches exactly this path — deriving it from
+ * config instead would let a checkout elsewhere be watched by accident.
+ *
+ * @returns {string} the spec's absolute path.
+ */
+export function specPath() {
+  return fileURLToPath(SPEC_FILE_URL)
+}
+
+/**
+ * The complete prompt body: the spec plus its trailing notes.
+ *
+ * This is the single composition point. Both the hot-reloading persona row and
+ * `verify.mjs` call it, so what the tests assert and what the model receives
+ * cannot drift apart.
+ *
+ * @param {(message: string) => void} [warn] - sink for non-fatal diagnostics.
+ * @returns {string} the body served as the system prompt.
+ */
+export function specBody(warn) {
+  return `${readSpec(warn)}\n\n${trailingNotes()}\n`
 }
 
 /**
@@ -194,7 +233,7 @@ function readSpec(warn) {
  * @returns {{id: string, name: string, description: string, order: number, plugins: object[]}} the definition.
  */
 export function buildDefinition(warn, options = {}) {
-  const spec = `${readSpec(warn)}\n\n${trailingNotes()}\n`
+  const spec = specBody(warn)
   const apiTest = options.apiTest ?? companionAvailable()
 
   if (!apiTest) {
@@ -207,10 +246,13 @@ export function buildDefinition(warn, options = {}) {
   const plugins = [
     {
       id: 'persona',
-      name: '@deepseek-ai/dsh-persona',
+      name: PERSONA_HOT_PACKAGE,
       config: {
-        prefix: spec,
-        complete: true
+        // Handed over for diagnostics only. The row reads the asset itself so
+        // it can re-read it later; a config string would be frozen by
+        // `structuredClone` at mount time, which is the whole problem this row
+        // exists to solve.
+        specCharacters: spec.length
       }
     }
   ]

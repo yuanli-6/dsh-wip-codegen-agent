@@ -170,7 +170,7 @@ if (!options.fromGithub) {
     const fingerprint = (root) => {
       const hash = createHash('sha256')
       // The files that decide behaviour: the preset rows and the spec text.
-      for (const rel of ['index.js', 'assets/wip-codegen/system-prompt.md']) {
+      for (const rel of ['index.js', 'persona-hot.js', 'assets/wip-codegen/system-prompt.md']) {
         hash.update(rel)
         hash.update(readFileSync(join(root, rel)))
       }
@@ -227,7 +227,20 @@ if (start === -1 || end === -1) {
     assert(stuck.length === 0, `not active: ${stuck.map((row) => `${row.moduleName}=${String(row.fiberStateName)}`).join(', ')}`)
   })
   check('the persona row is mounted', () => {
-    assert(composition.rows.some((row) => row.moduleName.includes('dsh-persona')), 'no persona row')
+    // The row is this bundle's own `persona-hot` module, not `dsh-persona`:
+    // that is what makes the spec re-read the file instead of freezing at mount.
+    assert(
+      composition.rows.some((row) => row.moduleName === `${BUNDLE_PACKAGE}/persona-hot`),
+      `no persona-hot row (rows: ${composition.rows.map((row) => row.moduleName).join(', ')})`
+    )
+  })
+  check('the static dsh-persona row is NOT mounted alongside it', () => {
+    // Two rows owning `deployment:persona-prefix` would let a static body
+    // shadow the live one, and the reload would silently stop working.
+    assert(
+      !composition.rows.some((row) => row.moduleName === '@deepseek-ai/dsh-persona'),
+      'the static persona row is mounted too — the live body would lose to it'
+    )
   })
   check('the testing companion and its skill tool are mounted', () => {
     for (const needle of [COMPANION_PACKAGE, 'dsh-tool-skill']) {
@@ -303,6 +316,18 @@ if (start === -1 || end === -1) {
   check('the persona is the complete prompt, without a rival', () => {
     const complete = (assembly.sectionNames ?? []).length === 1
     assert(complete, `complete:true expects one effective section, got ${JSON.stringify(assembly.sectionNames)}`)
+  })
+  check('the live section serves the file on disk, not a copy frozen at mount', () => {
+    // The whole point of the persona-hot row: the text is re-read from the
+    // asset on every assembly. If the two lengths differ, something pinned the
+    // body at mount time and editing the file would silently do nothing.
+    const live = assembly.personaChars
+    const file = observation.bundle?.specChars
+    assert(Number.isInteger(file) && file > 5000, `the installed bundle reported specChars = ${String(file)}`)
+    assert(
+      live === file,
+      `the live section carries ${String(live)} chars but the file holds ${String(file)} — the body is stale`
+    )
   })
 
   console.log('')

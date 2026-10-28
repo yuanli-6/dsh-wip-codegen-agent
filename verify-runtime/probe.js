@@ -142,15 +142,18 @@ async function observe(ctx) {
   try {
     const own = await import('dsh-wip-codegen-agent')
     const definition = own.buildDefinition()
-    const persona = definition.plugins.find((row) => row.name.includes('dsh-persona'))
+    // Read the body the way the live row does — from the file, not from row
+    // config. The persona row deliberately carries no prompt text (that is what
+    // makes it hot-reloadable), so `config.prefix` no longer exists to read.
+    const body = own.specBody()
     observation.bundle = {
       rowCount: definition.plugins.length,
       rows: definition.plugins.map((row) => row.name),
-      specChars: persona.config.prefix.length,
-      specHasSqlSection: persona.config.prefix.includes('十三、SQL Server 建表脚本生成规范'),
-      specHasConfirmation: persona.config.prefix.includes('十四、强制交互流程'),
-      specHasGlobalRules: persona.config.prefix.includes('十五、全局规则（用户追加）'),
-      specPathInjected: persona.config.prefix.includes('system-prompt.md')
+      specChars: body.length,
+      specHasSqlSection: body.includes('十三、SQL Server 建表脚本生成规范'),
+      specHasConfirmation: body.includes('十四、强制交互流程'),
+      specHasGlobalRules: body.includes('十五、全局规则（用户追加）'),
+      specPathInjected: body.includes('system-prompt.md')
     }
   } catch (error) {
     observation.bundle = { error: String(error?.message ?? error) }

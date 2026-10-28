@@ -5,7 +5,7 @@
 装上去，**新开对话选「WIP/HRP 代码生成」**即可用；卸掉，它干干净净消失。
 
 - 不注册任何 Tool，没有 Client 半边，**零依赖**；
-- 提示词正文是仓库里一份普通 Markdown（`assets/wip-codegen/system-prompt.md`），改它就行；
+- 提示词正文是仓库里一份普通 Markdown（`assets/wip-codegen/system-prompt.md`），**改完弹框确认即可热加载**，不用重装（见下方「改规范正文」）；
 - 装/卸靠一行插件行，**真热插拔**（见下方「为什么说热插拔」）。
 
 ## 这个 Agent 能做什么
@@ -16,7 +16,8 @@
 | **Java 代码生成** | Spring Boot 3 + MyBatis-Plus：实体、Req/Resp、Import/Export、Mapper + XML、Service + ServiceImpl、Controller |
 | **先确认再落地（红线）** | SQL 出草案后必须**逐个字段**与用户确认（补充/删除/修改）才写文件；代码生成前先问「一次性全部 / 逐个类确认」，逐个模式每生成一个类就停下确认；**任何删除（文件/类/字段/方法/表）必须先确认**才执行 |
 | **复制现有 Controller 风格** | 先把一个已存在的 Controller 定为「风格基准类」，**真实读源码**抽出包/注解/注入/命名/返回包装/日志/注释风格，之后每个类都按它复制；与规范冲突时以基准类为准并说明 |
-| **全局规则沉淀** | 用户说「以后都这样 / 全局都要 / 加到规范里」→ Agent 把规则追加进正文 §十五「全局规则（用户追加）」，本次会话立即生效，下次会话需重载插件 |
+| **全局规则沉淀** | 用户说「以后都这样 / 全局都要 / 加到规范里」→ Agent 把规则追加进正文 §十五「全局规则（用户追加）」，**写完弹框确认即可热加载**，不需要重装插件 |
+| **规则冲突先问** | §十五 与 §二～§六 冲突时不自行裁决：先列「被覆盖的条目 + 覆盖理由」，让你选覆盖 / 并存 / 放弃，确认后才写进 §十五 并标注「覆盖 §x.y」 |
 | **接口测试（内置 api-test 技能）** | 挂载 `dsh-api-test-bundle`：本地联调 HTTP/SOAP/RPC/MQ/Spring Integration/本地方法，测试完**必出主流格式测试用例**（Markdown + 真 `.xlsx`）、**接口返回字段来源关系图**、调用链路图与 UML 类图；参数只在正常区间变更，代码已显式校验的错误参数不再重复造用例 |
 
 ## 安装
@@ -35,7 +36,7 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 预设里引用一个装不上的包会让整条预设激活失败（见「两个真实的坑」），所以插件会先探测
 `dsh-api-test-bundle` 是否可解析，解析不到就只记一条警告、不挂那两行。
 
-锁定版本：`github:yuanli-6/dsh-wip-codegen-agent#v2.0.1`。
+锁定版本：`github:yuanli-6/dsh-wip-codegen-agent#v2.3.0`。
 本地改代码时用目录安装：`action: install_bundle, target: <本目录绝对路径>`。
 
 装完**新开一个对话**，预设选择里就能看到 **WIP/HRP 代码生成**。
@@ -64,7 +65,7 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 
 ### 它被配成什么样
 
-**系统提示词**：`@deepseek-ai/dsh-persona` 的 `prefix` 承载规范全文，并且 `complete: true`。
+**系统提示词**：本包自带的 `persona-hot.js` 在 `deployment:persona-prefix` 段上承载规范全文，并且 `complete: true`。
 
 `complete: true` 是平台第一方表达「这段就是完整系统提示词」的方式。含义是：
 **只有这份规范进上下文**，记忆导引、team 政策、plan 政策、其他插件的工具指引都不会再注入。
@@ -85,7 +86,7 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 
 | 行 | 为什么给 |
 |---|---|
-| `@deepseek-ai/dsh-persona` | 承载规范正文（`complete: true`） |
+| `dsh-wip-codegen-agent/persona-hot` | 承载规范正文（`complete: true`）；正文是函数，每步重读文件，改完弹框确认即生效 |
 | `@deepseek-ai/dsh-tool-skill` | 渲染技能目录 + 提供 `skill` 加载工具；**没有它，内置的 api-test 技能永远加载不了** |
 | `dsh-api-test-bundle` | 接口测试技能本体（可选，装不到就自动不挂） |
 | `tool-fs` / `tool-fs-search` | 读 SQL/样例/基准类、写生成出的代码 |
@@ -109,6 +110,10 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 > 修法不是换变量名，而是**删掉那一行**：工作目录本来就由工作目录服务以必需运行时上下文
 > （`Current working directory: …`）下发，`complete: true` 压不掉它，重述一遍既多余又致命。
 > 用 v2.0.0 的请按「发布新版本」的三步升级。
+
+> **v2.3.0 加了热加载**：persona 行从 `@deepseek-ai/dsh-persona` 换成自带的 `persona-hot.js`，
+> 正文改完弹框确认即可生效，不用重装（见「改规范正文」）。顺带给 §十五 加了一条强制约束：
+> 全局规则与 §二～§六 冲突时必须先问，不得自行裁决。
 
 ### 两个必需的配置字段（别删）
 
@@ -151,15 +156,37 @@ v1.x 正是漏了这两个字段，所以那个版本**从来没有真正可用�
 
 ### 改规范正文（含 §十五 全局规则）
 
-改 `assets/wip-codegen/system-prompt.md`，然后让插件重新加载：
+改 `assets/wip-codegen/system-prompt.md`，保存后**插件会弹出确认框**：
 
 ```
-action: set_plugin, target: include:dsh-wip-codegen-agent, enabled: false
-action: set_plugin, target: include:dsh-wip-codegen-agent, enabled: true
+规范正文已修改
+检测到规范正文已修改（24034 → 24180 字符）。是否立即热加载？
+  [立即热加载]  从下一步起使用新正文
+  [稍后再说]    继续使用当前正文；再次修改文件会重新保存并重新询问
 ```
 
-正文是在**插件激活那一刻**读进内存的（`register()` 要求定义当场给全，没有惰性加载回调），
-所以**只改文件不会自动生效**——不 toggle 就重启 DSH。
+点 **立即热加载** 就生效——**不用重装、不用 toggle、不用重启 DSH**。
+
+热加载为什么能生效：`index.js` 不再挂 `@deepseek-ai/dsh-persona`（它把正文当**配置字符串**收下，
+而预设配置在挂载时会被 `structuredClone`，正文因此被钉死在激活那一刻），改挂本包自带的
+`persona-hot.js`。它注册**同名同序**的 `deployment:persona-prefix` 段，但 `text` 是一个**函数**——
+提示词注册表每次组装都会重新调用它（`text: typeof section.text === "function" ? section.text(context) : section.text`），
+而组装每个 agent step 跑一次，所以函数里重读文件就等于正文常驻最新。
+
+几个要说清楚的行为：
+
+| 场景 | 行为 |
+|---|---|
+| 保存文件 | 监视器防抖 400ms 后读盘；内容没变则不弹框 |
+| 读到的内容含 `规范正文未能读取` | 判为「编辑器正在截断写入」，**拒绝采纳**，继续用当前正文 |
+| 点了「稍后再说」 | 丢弃这次变更；**下次再改文件会重新弹框** |
+| 当前没有活着的 root agent（如刚启动） | 只记一条日志，等下一个请求开始时再弹框 |
+| 宿主没有问答服务（headless） | 记一条警告后**丢弃变更**，不会每步重问；此时仍需重装 |
+| 生效时机 | 组装 step N 发生在 `agent/pre-step` for step N **之前**，所以确认后从 **step N+1** 起生效 |
+
+> 监视的是**已安装副本**（`$DSH_HOME/profiles/<profile>/node_modules/dsh-wip-codegen-agent/assets/wip-codegen/system-prompt.md`），
+> 也就是提示词里那行「规范正文路径」指向的文件。仓库源码那份不监视：改了源码仍需重新安装才真正生效，
+> 监视它只会让你误以为已经生效。
 
 > **§十五 是 Agent 自己追加全局规则的地方，而重装插件会用仓库里的正文覆盖它。**
 > 升级前先把 §十五 的内容备份出来，装完再贴回去。
@@ -196,7 +223,11 @@ node check-encoding.mjs    # 全仓库无 BOM、JSON 可解析、脚本语法通
 ```powershell
 node verify-runtime/run.mjs                 # 用本地目录装进一个隔离 profile
 node verify-runtime/run.mjs --from-github   # 改成从 GitHub 装（发布后必跑）
+node verify-runtime/run.mjs --dsh "C:\path\to\dsh.cmd"   # 启动器不在默认位置时
 ```
+
+> 启动器默认取 `G:/tool/deepseekharness/resources/runtime/cli/bin/dsh.cmd`（Windows）或 PATH 上的 `dsh`。
+> 装在别处就加 `--dsh`，否则会在第一行报 `launcher not found`。
 
 它会：
 
@@ -205,7 +236,9 @@ node verify-runtime/run.mjs --from-github   # 改成从 GitHub 装（发布后�
 2. 装本插件 + 测试插件（**先 remove 再 add**，理由见下）；
 3. 用 `--patch` 挂一个只读探针，启动后读取**真实装配结果**：预设是否 `broken`、每行插件的
    `fiberState`、预设作用域内的技能目录、`api-test` 正文是否带新规则、
-   persona 会不会拿到正文与注入路径；并在预设作用域里**真跑一次提示词组装与渲染**
+   persona 行是不是自带的 `persona-hot`（且静态 persona 行没有并挂）、
+   **live 段落的字符数是否等于磁盘文件**（不等就说明正文被钉在了挂载那一刻）；
+   并在预设作用域里**真跑一次提示词组装与渲染**
    （`systemPrompt.assemble()` + `renderPrompt()`），把组装异常原样报回来；
 4. 断言完把临时 `DSH_HOME` 删掉（`--keep` 可保留排查）。
 
@@ -256,7 +289,8 @@ action: set_plugin, target: include:dsh-wip-codegen-agent, enabled: true
 dsh-wip-codegen-agent/
 ├── package.json                        # 声明 dsh.bundle.patch
 ├── cordis.patch.yml                    # insert 一行插件条目（热插拔的开关）
-├── index.js                            # 唯一逻辑：buildDefinition() + apply()
+├── index.js                            # 预设定义：buildDefinition() + apply()
+├── persona-hot.js                      # persona 行：正文每步重读文件，改完即生效
 ├── assets/
 │   └── wip-codegen/
 │       └── system-prompt.md            # 规范正文（唯一可编辑的内容源，含 §十五 全局规则）
@@ -284,6 +318,11 @@ dsh-wip-codegen-agent/
 
 正文从 `assets/` 读盘；万一读不到，退化成一段**自诊断提示词**而不是让注册失败——
 预设存在且能自述损坏，比预设凭空消失好定位得多。
+
+persona 那一行挂的是本包自己的 `persona-hot.js`，不是平台自带的 `@deepseek-ai/dsh-persona`。
+差别只有一个，但很关键：后者的正文是**配置字符串**，而预设配置在挂载时会被 `structuredClone`，
+于是正文被钉死在激活那一刻；前者的正文是**函数**，提示词注册表每次组装都重新调用，
+所以文件一改、下一步就是新正文（详见「改规范正文」）。
 
 ## License
 
