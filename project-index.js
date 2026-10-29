@@ -1070,8 +1070,10 @@ export async function buildProjectIndex(options) {
     const unchanged = cached !== undefined && cached.size === info.size && cached.mtimeMs === info.mtimeMs
 
     let summary = ''
+    let hash = ''
     if (unchanged) {
       summary = cached.summary ?? ''
+      hash = cached.hash ?? ''
       nextEntries[rel] = cached
       if (previousEntries[rel] !== undefined) contentLogic[rel] = previousEntries[rel]
       reused += 1
@@ -1085,6 +1087,7 @@ export async function buildProjectIndex(options) {
       // the watcher replaces a debounce later; skipping every new file costs
       // the whole index.
       summary = cached.summary ?? ''
+      hash = cached.hash ?? ''
       nextEntries[rel] = cached
       if (previousEntries[rel] !== undefined) contentLogic[rel] = previousEntries[rel]
       skipped += 1
@@ -1101,7 +1104,7 @@ export async function buildProjectIndex(options) {
         skipped += 1
         continue
       }
-      const hash = createHash('sha256').update(source).digest('hex')
+      hash = createHash('sha256').update(source).digest('hex')
       const hashMatches = cached !== undefined && cached.hash === hash
       if (hashMatches && previousEntries[rel] !== undefined) {
         contentLogic[rel] = previousEntries[rel]
@@ -1119,7 +1122,11 @@ export async function buildProjectIndex(options) {
 
     const directory = dirOf(rel)
     const bucket = buckets.get(directory)
-    const child = { path: rel, type: 'file', language: languageOf(rel), summary }
+    // The hash travels WITH the index, not only in the sidecar: it is the
+    // freshness evidence the model needs. A lease can only say "built recently";
+    // a hash says "this exact file still has these exact bytes", which is what
+    // makes an entry safe to trust and safe to edit against without re-reading.
+    const child = { path: rel, type: 'file', language: languageOf(rel), summary, hash }
     if (bucket === undefined) buckets.set(directory, [child])
     else bucket.push(child)
   }
@@ -1347,6 +1354,40 @@ export function readIndexEntry(index, relPath, symbol) {
   }
 }
 
+/**
+ * Compare one entry's recorded sha256 against the file on disk.
+ *
+ * The lease says when the index was built; this says whether the entry still
+ * describes the bytes that are there now. Only the second question licenses
+ * trusting an entry (or editing against it) without reading the source.
+ *
+ * @param {object} index - a built index.
+ * @param {string} root - project root.
+ * @param {string} relPath - path relative to the root, exact or as a suffix.
+ * @param {(path: string) => Promise<string>} readText - reads a file, or rejects.
+ * @returns {Promise<object|null>} the comparison, or null when not indexed.
+ */
+export async function checkEntry(index, root, relPath, readText) {
+  const entry = readIndexEntry(index, relPath)
+  if (entry === null) return null
+  if (entry.file === null) return null
+
+  const indexedHash = typeof entry.file.hash === 'string' ? entry.file.hash : ''
+  let currentHash = ''
+  try {
+    const source = await readText(join(root, ...entry.path.split('/')))
+    currentHash = createHash('sha256').update(source).digest('hex')
+  } catch {
+    currentHash = ''
+  }
+  return {
+    path: entry.path,
+    indexedHash,
+    currentHash,
+    same: indexedHash !== '' && indexedHash === currentHash
+  }
+}
+
 // ---------------------------------------------------------------------------
 // rendering (tool output)
 // ---------------------------------------------------------------------------
@@ -1484,6 +1525,55 @@ export function formatRead(entry, relPath) {
     for (const item of logic.logic_details) lines.push(`- ${item.rule_name}：${item.description}`)
   }
   return lines.join('\n')
+}
+
+/**
+ * Render the `verify` action: is the entry still describing the file on disk?
+ *
+ * This is the freshness proof the model actually needs. `last_updated` says when
+ * the *index* was built, which is a different question — an index built one
+ * second ago can still describe an older file if that file changed and the
+ * watcher has not fired yet. Comparing the sha256 recorded in the index against
+ * the file on disk answers the question that matters: can this entry be trusted
+ * without opening the source?
+ *
+ * @param {object|null} check - from `checkEntry`.
+ * @param {string} relPath - the requested path.
+ * @returns {string} text for the model.
+ */
+export function formatVerify(check, relPath) {
+  if (check === null || check === undefined) {
+    return (
+      `索引里没有「${relPath}」，无从比对。\n` +
+      '先用 action=query 找一个文件路径；索引只收录 Java 与 MyBatis XML 的结构化条目。'
+    )
+  }
+  if (check.indexedHash === '') {
+    return (
+      `「${check.path}」在索引里，但没有记录 hash（多半是旧版索引建的条目）。\n` +
+      '用 action=build 重建一次就会补上；在那之前按不可信处理，改源码前自己 read 一遍。'
+    )
+  }
+  if (check.currentHash === '') {
+    return (
+      `「${check.path}」在索引里有条目，但磁盘上读不到这个文件（已删除或改名）。\n` +
+      '说明索引落后于工作区：用 action=build 重建。'
+    )
+  }
+  if (check.same) {
+    return (
+      `「${check.path}」未改动，索引条目可信。\n` +
+      `sha256：${check.indexedHash}\n` +
+      '结论：可以直接用索引里的类/字段/方法/规则回答，也可以基于它改源码——hash 一致就说明索引描述的就是当前这份文件，不必先全量读一遍；只读要改的那几行。'
+    )
+  }
+  return (
+    `「${check.path}」已改动，索引条目过期。\n` +
+    `索引记录：${check.indexedHash}\n` +
+    `磁盘现状：${check.currentHash}\n` +
+    '结论：这一条的摘要、方法、规则都不能直接采信。改源码前必须自己读这个文件；' +
+    '同时说明监听器会在下一次增量时更新它（也可 action=build 立即重建）。'
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,12 +1813,14 @@ export function createProjectIndexService(options) {
 /** Tool description shown to the model. */
 const TOOL_DESCRIPTION =
   '读取当前项目的复合索引（.dsh/index/project_index.json），在不动源码的前提下看清项目结构与业务逻辑。' +
-  '索引由后台监听器维护，每 30 分钟或检测到文件变化时增量更新。' +
-  '先查这里，再决定要不要读源码：除非用户明确要求改源码，否则不要为了回答问题去全量读取源码文件。' +
+  '索引由后台监听器维护，每 30 分钟或检测到文件变化时增量更新；每个文件条目都带该文件的 sha256。' +
+  '信任规则按 hash 判断，不按时间判断：action=verify 比对索引里的 hash 与磁盘现状——' +
+  'hash 一致说明索引描述的就是当前这份文件，可以直接用它的类/字段/方法/规则回答，也可以直接基于它改源码，不必先全量读一遍；' +
+  'hash 不一致说明这一条已过期，改源码前必须自己读该文件。' +
   'action=status 先看索引是否就绪；action=query 按关键词（文件路径/类名/方法名/业务规则）检索；' +
   'action=read 读某个文件的结构化条目（类、字段、方法、业务规则），可用 symbol 收窄到单个类或方法；' +
-  'action=build 强制全量重建（通常不必手动调用）。' +
-  '本工具不会等待构建完成：索引缺失或过期时它直接说明现状，此时改用 grep/glob/read 回答当前问题，' +
+  'action=verify 校验某个文件的条目是否仍然可信（改源码之前做这一步）；action=build 强制全量重建（通常不必手动调用）。' +
+  '本工具不会等待构建完成：索引缺失时它直接说明现状，此时改用 grep/glob/read 回答当前问题，' +
   '并告诉用户「已触发后台索引构建，当前我先基于原生检索为您解答」。'
 
 /** Parameter schema. */
@@ -1737,8 +1829,9 @@ const TOOL_PARAMETERS = {
   properties: {
     action: {
       type: 'string',
-      enum: ['status', 'query', 'read', 'build'],
-      description: 'status 看索引状态；query 按关键词检索；read 读单个文件的结构；build 强制全量重建。'
+      enum: ['status', 'query', 'read', 'verify', 'build'],
+      description:
+        'status 看索引状态；query 按关键词检索；read 读单个文件的结构；verify 校验条目是否仍可信（改源码前用）；build 强制全量重建。'
     },
     query: {
       type: 'string',
@@ -1746,7 +1839,7 @@ const TOOL_PARAMETERS = {
     },
     path: {
       type: 'string',
-      description: 'action=read 时的文件路径，相对项目根，可只写路径后缀。'
+      description: 'action=read 或 action=verify 时的文件路径，相对项目根，可只写路径后缀。'
     },
     symbol: {
       type: 'string',
@@ -1840,6 +1933,24 @@ export function createProjectIndexTool(options) {
           }
         }
         return { text: formatRead(readIndexEntry(index, relPath, args?.symbol), relPath) }
+      }
+
+      if (action === 'verify') {
+        const index = await service.loadIndex()
+        const relPath = typeof args?.path === 'string' ? args.path : ''
+        if (relPath === '') {
+          return { text: 'action=verify 需要 path：要给哪个文件做校验。' }
+        }
+        if (index === null) {
+          service.ensure('工具校验')
+          return {
+            text:
+              '索引尚未生成，没有可比对的条目，已在后台开始构建（不阻塞本次回答）。' +
+              '现在按不可信处理：改源码前自己 read 一遍该文件。'
+          }
+        }
+        const check = await checkEntry(index, root, relPath, (path) => readFile(path, 'utf8'))
+        return { text: formatVerify(check, relPath) }
       }
 
       if (action !== 'status') {

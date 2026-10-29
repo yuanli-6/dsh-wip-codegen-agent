@@ -290,7 +290,8 @@ if (start === -1 || end === -1) {
       `the description is too short to carry the contract (${String(observation.tools.projectIndexDescriptionLength)} chars)`
     )
     assert(
-      JSON.stringify(observation.tools.projectIndexActions) === JSON.stringify(['status', 'query', 'read', 'build']),
+      JSON.stringify(observation.tools.projectIndexActions) ===
+        JSON.stringify(['status', 'query', 'read', 'verify', 'build']),
       `unexpected actions: ${JSON.stringify(observation.tools.projectIndexActions)}`
     )
   })

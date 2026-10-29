@@ -13,7 +13,9 @@
  *
  * Run: node verify.mjs
  */
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const PKG = JSON.parse(readFileSync('package.json', 'utf8'))
@@ -134,10 +136,28 @@ check('spec makes the project index the default way in (§十七)', () => {
     'content_logic_index',
     'logic_details',
     '除非用户明确要求改源码，否则绝不全量读取源码文件',
-    '已触发后台索引构建，当前我先基于原生检索为您解答'
+    '已触发后台索引构建，当前我先基于原生检索为您解答',
+    'action=verify',
+    'sha256'
   ]) {
     assert(rawSpec.includes(needle), `§十七 no longer mentions "${needle}"`)
   }
+  // Trust is decided by content hash, never by the age of the index. A lease
+  // cannot distinguish a fresh entry from a stale one — an index built one
+  // second ago can still describe an older file. Pinning the wording here keeps
+  // the spec from drifting back to "built within 30 minutes means trustworthy".
+  assert(
+    rawSpec.includes('### 17.2 可信度看 hash，不看时间'),
+    '§十七 lost the section that makes hash the trust criterion'
+  )
+  assert(
+    rawSpec.includes('hash 一致') && rawSpec.includes('hash 不一致'),
+    '§十七 no longer states what hash agreement and disagreement mean'
+  )
+  assert(
+    !/`last_updated` 在 30 分钟内/.test(rawSpec),
+    '§十七 has drifted back to a time-based freshness rule'
+  )
 })
 
 // ── the definition handed to agentPresets.register() ──────────────────────────
@@ -704,14 +724,86 @@ check('the tool definition is well-formed', () => {
   assert(tool.parameters?.type === 'object', 'parameters is not an object schema')
   assert(Array.isArray(tool.parameters?.properties?.action?.enum), 'action has no enum')
   assert(tool.parameters.properties.action.enum.includes('query'), 'action is missing query')
+  assert(tool.parameters.properties.action.enum.includes('verify'), 'action is missing verify')
   assert(typeof tool.output?.render === 'function', 'output.render is not a function')
   const rendered = tool.output.render({}, { text: 'hello' })
   assert(Array.isArray(rendered) && rendered[0].text === 'hello', 'render did not produce a text block')
 })
 check('the tool description carries the contract the model needs', () => {
   const tool = indexModule.createProjectIndexTool({ resolve: async () => ({ root: '.', service: {} }) })
-  for (const needle of ['.dsh/index/project_index.json', '除非用户明确要求改源码', 'action=query', 'action=read']) {
+  for (const needle of [
+    '.dsh/index/project_index.json',
+    'action=query',
+    'action=read',
+    'action=verify',
+    'sha256'
+  ]) {
     assert(tool.description.includes(needle), `tool description no longer mentions "${needle}"`)
+  }
+  // Trust is decided by content hash, not by how long ago the index was built.
+  // A lease cannot tell a fresh entry from a stale one; a hash can.
+  assert(
+    tool.description.includes('hash 一致') && tool.description.includes('hash 不一致'),
+    'the tool description no longer states the hash-consistency rule'
+  )
+  assert(
+    !tool.description.includes('30 分钟内'),
+    'the tool description has drifted back to a time-based freshness rule'
+  )
+})
+check('every indexed file carries its sha256 in the index itself', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-hash-'))
+  try {
+    mkdirSync(join(root, 'src'), { recursive: true })
+    writeFileSync(join(root, 'src', 'Alpha.java'), 'public class Alpha {\n    int count;\n}\n', 'utf8')
+    const built = await indexModule.buildProjectIndex({ root, now: Date.now() + 10_000 })
+    const children = (built.index.directory_index ?? []).flatMap((entry) => entry.children ?? [])
+    assert(children.length > 0, 'the index has no file children')
+    for (const child of children) {
+      assert(
+        typeof child.hash === 'string' && /^[0-9a-f]{64}$/.test(child.hash),
+        `"${child.path}" has no sha256 in directory_index (hash = ${JSON.stringify(child.hash)})`
+      )
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+check('verify reports agreement, disagreement and absence', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-verify-'))
+  try {
+    mkdirSync(join(root, 'src'), { recursive: true })
+    const file = join(root, 'src', 'Alpha.java')
+    writeFileSync(file, 'public class Alpha {\n    int count;\n}\n', 'utf8')
+    const built = await indexModule.buildProjectIndex({ root, now: Date.now() + 10_000 })
+    const index = built.index
+
+    const same = await indexModule.checkEntry(index, root, 'src/Alpha.java', (path) =>
+      readFileSync(path, 'utf8')
+    )
+    assert(same !== null && same.same === true, 'an untouched file was not reported as matching')
+    const sameText = indexModule.formatVerify(same, 'src/Alpha.java')
+    assert(sameText.includes('未改动') && sameText.includes('sha256'), `same text is "${sameText}"`)
+
+    writeFileSync(file, 'public class Alpha {\n    int count;\n    int extra;\n}\n', 'utf8')
+    const changed = await indexModule.checkEntry(index, root, 'src/Alpha.java', (path) =>
+      readFileSync(path, 'utf8')
+    )
+    assert(changed !== null && changed.same === false, 'an edited file was still reported as matching')
+    const changedText = indexModule.formatVerify(changed, 'src/Alpha.java')
+    assert(
+      changedText.includes('已改动') && changedText.includes('索引记录') && changedText.includes('磁盘现状'),
+      `changed text is "${changedText}"`
+    )
+
+    const missing = await indexModule.checkEntry(index, root, 'src/Nope.java', (path) =>
+      readFileSync(path, 'utf8')
+    )
+    assert(missing === null, 'an unindexed path produced a comparison')
+    const missingText = indexModule.formatVerify(missing, 'src/Nope.java')
+    assert(missingText.includes('索引里没有'), `missing text is "${missingText}"`)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })
 check('ignored paths cover the noise and keep the sources', () => {
