@@ -1485,7 +1485,17 @@ export function formatRead(entry, relPath) {
   }
   const lines = [`文件：${entry.path}`]
   if (entry.directory !== null) lines.push(`所在目录：${entry.directory}`)
-  if (entry.file !== null) lines.push(`语言：${entry.file.language} · 摘要：${entry.file.summary}`)
+  if (entry.file !== null) {
+    lines.push(`语言：${entry.file.language} · 摘要：${entry.file.summary}`)
+    // The hash belongs next to the content it vouches for. Making the model call
+    // `verify` as a separate step means it reads the logic first and decides
+    // afterwards; showing both at once is what lets one call end the question.
+    const hash = typeof entry.file.hash === 'string' ? entry.file.hash : ''
+    if (hash !== '') {
+      lines.push(`sha256：${hash}`)
+      lines.push('可信度：用 action=verify 与磁盘比对；一致就可以直接照着上面的结构改，不必先全量读源码，不一致必须先自己读这个文件。')
+    }
+  }
 
   const logic = entry.logic
   if (logic === null) {

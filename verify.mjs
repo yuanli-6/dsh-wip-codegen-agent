@@ -717,6 +717,26 @@ check('reading a path the index does not know says so instead of pretending', ()
   assert(text.includes('索引里没有'), `text is "${text}"`)
   assert(text.includes('query'), 'the message does not point at action=query')
 })
+check('reading an entry shows its sha256, so one call answers freshness too', () => {
+  const hash = 'a'.repeat(64)
+  const index = {
+    project_meta: {},
+    directory_index: [
+      {
+        path: '.',
+        type: 'directory',
+        summary: '',
+        children: [{ path: 'A.java', type: 'file', language: 'Java', summary: '', hash }]
+      }
+    ],
+    content_logic_index: { 'A.java': indexModule.parseJavaSource('public class A { }', 'A.java') }
+  }
+  const text = indexModule.formatRead(indexModule.readIndexEntry(index, 'A.java'), 'A.java')
+  // The hash is only worth shipping if the model can see it without asking for
+  // it: read-then-verify is two round trips for one question.
+  assert(text.includes(hash), `the rendered entry omits the sha256: "${text}"`)
+  assert(text.includes('action=verify'), 'the rendered entry does not say how to check the hash')
+})
 check('the tool definition is well-formed', () => {
   const tool = indexModule.createProjectIndexTool({ resolve: async () => ({ root: '.', service: {} }) })
   assert(tool.name === 'project_index', `tool name is "${tool.name}"`)
