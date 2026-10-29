@@ -508,6 +508,23 @@ check('the index module exports the index format constants', () => {
     `LEASE_MS = ${indexModule.LEASE_MS} — the spec fixes a 30-minute listener lifetime`
   )
 })
+check('the index row declares tools as a required service, in array form', () => {
+  // Both halves of this shipped broken once and only `verify-runtime` noticed.
+  //
+  // `inject` must be an ARRAY: cordis reads an object's keys as Service names, so
+  // `{ required: [...], optional: [...] }` waits forever for services called
+  // `required` and `optional` and leaves the row PENDING.
+  //
+  // `tools` must be REQUIRED: looked up lazily with `ctx.get('tools', false)` at
+  // activation it is often not on the context yet, the registration silently
+  // no-ops, and the only retry hung off `agent/pre-step` — so a preset that is
+  // mounted but never runs a step ships a tool the model cannot see.
+  assert(Array.isArray(indexModule.inject), `inject is ${JSON.stringify(indexModule.inject)}, not an array`)
+  assert(
+    indexModule.inject.includes('tools'),
+    `inject = ${JSON.stringify(indexModule.inject)} — the project_index tool would never register`
+  )
+})
 
 check('a Java class, its fields and its methods are extracted', () => {
   const entry = indexModule.parseJavaSource(
