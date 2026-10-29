@@ -121,6 +121,24 @@ check('spec tells the model when to delegate, since the tool rows cannot', () =>
     assert(rawSpec.includes(needle), `§16.10 no longer mentions "${needle}"`)
   }
 })
+check('spec makes the project index the default way in (§十七)', () => {
+  // The `project_index` tool description states the contract of the tool; §十七
+  // states the contract of the *session* — query first, do not read sources
+  // unless the user asked for a source change. Both are needed: the tool
+  // description is only read when the model is already considering the tool.
+  for (const needle of [
+    '## 十七、项目索引优先（本预设的默认工作方式）',
+    '.dsh/index/project_index.json',
+    'project_meta',
+    'directory_index',
+    'content_logic_index',
+    'logic_details',
+    '除非用户明确要求改源码，否则绝不全量读取源码文件',
+    '已触发后台索引构建，当前我先基于原生检索为您解答'
+  ]) {
+    assert(rawSpec.includes(needle), `§十七 no longer mentions "${needle}"`)
+  }
+})
 
 // ── the definition handed to agentPresets.register() ──────────────────────────
 const { buildDefinition, companionAvailable, name: pluginName, inject } = await import('./index.js')
@@ -132,6 +150,9 @@ const { readSpecBody } = await import('./persona-hot.js')
 
 /** The row name `index.js` must use for the persona. */
 const PERSONA_ROW = 'dsh-wip-codegen-agent/persona-hot'
+
+/** The row name `index.js` must use for the project index. */
+const PROJECT_INDEX_ROW = 'dsh-wip-codegen-agent/project-index'
 
 /** The body the persona row serves right now. */
 const personaBody = readSpecBody((message) => warnings.push(message))
@@ -176,12 +197,13 @@ check('every row is a well-formed entry', () => {
     }
   }
 })
-check('every row names a first-party package, the companion, a group, or this bundle own persona', () => {
+check('every row names a first-party package, the companion, a group, or one of this bundle own rows', () => {
+  const ownRows = new Set([PERSONA_ROW, PROJECT_INDEX_ROW])
   for (const row of flattenRows(definition.plugins)) {
     const firstParty = row.name.startsWith('@deepseek-ai/dsh-')
     assert(
-      firstParty || row.name === 'dsh-api-test-bundle' || row.name === PERSONA_ROW,
-      `row ${row.id} names "${row.name}", which is neither first-party, the companion, nor ${PERSONA_ROW}`
+      firstParty || row.name === 'dsh-api-test-bundle' || ownRows.has(row.name),
+      `row ${row.id} names "${row.name}", which is neither first-party, the companion, nor one of ${[...ownRows].join(' / ')}`
     )
   }
 })
@@ -336,11 +358,12 @@ check('with the companion absent the Agent still mounts its core rows', () => {
   for (const needle of [PERSONA_ROW, 'dsh-tool-fs', 'dsh-tool-fs-search', 'dsh-tool-ask-user', 'dsh-tool-todo']) {
     assert(names.some((n) => n.includes(needle)), `core row ${needle} was dropped too`)
   }
+  assert(names.includes(PROJECT_INDEX_ROW), `the project-index row was dropped without the companion`)
   const shells = names.filter((n) => n.includes('tool-pwsh') || n.includes('tool-bash'))
   assert(shells.length === 1, `expected exactly 1 shell row without the companion, got ${shells.length}`)
   assert(
-    flattenRows(gated.plugins).length === 13,
-    `expected 13 rows without the companion, got ${flattenRows(gated.plugins).length}`
+    flattenRows(gated.plugins).length === 14,
+    `expected 14 rows without the companion, got ${flattenRows(gated.plugins).length}`
   )
 })
 check('with the companion absent a diagnostic is emitted', () => {
@@ -425,6 +448,268 @@ check('no memory or plugin-manager rows are mounted', () => {
   }
 })
 
+// ── the project index ────────────────────────────────────────────────────────
+//
+// The engine is pure functions over strings, so it can be asserted without a
+// host, a filesystem, or a model. That is deliberate: the listener's whole value
+// is that it is deterministic, and a deterministic thing is worth testing.
+console.log('')
+console.log('project index')
+
+const indexRow = definition.plugins.find((row) => row.name === PROJECT_INDEX_ROW)
+
+check('the project-index row is mounted and enabled', () => {
+  assert(indexRow !== undefined, `no row named ${PROJECT_INDEX_ROW}`)
+  assert(indexRow.disabled !== true, 'the project-index row is disabled, so the index would never build')
+  assert(indexRow.id === 'project-index', `row id is "${indexRow.id}"`)
+})
+check('the project-index row carries no config (the root comes from the working directory)', () => {
+  // A path in the row config would be structuredClone'd at mount and keep
+  // pointing at whatever project was open then. The row resolves the root from
+  // the working-directory service on every build instead.
+  assert(indexRow.config === undefined, `unexpected config ${JSON.stringify(indexRow.config)}`)
+})
+check('the project-index row sits right after agent-instructions', () => {
+  const ids = definition.plugins.map((row) => row.id)
+  const at = ids.indexOf('project-index')
+  assert(at > 0, 'the project-index row is not in the top-level list')
+  assert(ids[at - 1] === 'agent-instructions', `row order is ${ids.join(' → ')}`)
+})
+
+const indexModule = await import('./project-index.js')
+
+check('the index module exports the pure engine pieces', () => {
+  for (const name of [
+    'parseJavaSource',
+    'parseXmlMapper',
+    'summarizeFile',
+    'summarizeDirectory',
+    'queryIndex',
+    'readIndexEntry',
+    'formatStatus',
+    'formatQuery',
+    'formatRead',
+    'createProjectIndexTool',
+    'shouldIgnorePath',
+    'apply'
+  ]) {
+    assert(typeof indexModule[name] === 'function', `${name} is not exported`)
+  }
+})
+check('the index module exports the index format constants', () => {
+  assert(indexModule.INDEX_VERSION >= 1, `INDEX_VERSION = ${indexModule.INDEX_VERSION}`)
+  assert(typeof indexModule.INDEX_RELATIVE_PATH === 'string', 'INDEX_RELATIVE_PATH is not a string')
+  assert(
+    indexModule.INDEX_RELATIVE_PATH.replace(/\\/g, '/') === '.dsh/index/project_index.json',
+    `INDEX_RELATIVE_PATH = ${indexModule.INDEX_RELATIVE_PATH} — the spec fixes this path`
+  )
+  assert(
+    indexModule.LEASE_MS === 30 * 60 * 1000,
+    `LEASE_MS = ${indexModule.LEASE_MS} — the spec fixes a 30-minute listener lifetime`
+  )
+})
+
+check('a Java class, its fields and its methods are extracted', () => {
+  const entry = indexModule.parseJavaSource(
+    [
+      'package com.demo.controller;',
+      '',
+      '/**',
+      ' * 考勤同步控制器。',
+      ' */',
+      '@RestController',
+      '@RequestMapping("/attendance")',
+      'public class AttendanceController extends BaseController implements InitializingBean {',
+      '',
+      '    /** 同步开关 */',
+      '    private boolean syncEnabled = true;',
+      '',
+      '    /**',
+      '     * 触发一次考勤同步。',
+      '     */',
+      '    @PostMapping("/sync")',
+      '    public Result<List<AttendanceResp>> sync(AttendanceReq req, String operator) {',
+      '        if (req.getBeginDate() == null) {',
+      '            throw new IllegalArgumentException("开始日期不能为空");',
+      '        }',
+      '        return Result.ok(attendanceService.sync(req));',
+      '    }',
+      '}'
+    ].join('\n'),
+    'AttendanceController.java'
+  )
+  assert(entry.classes.length === 1, `expected 1 class, got ${entry.classes.length}`)
+  const klass = entry.classes[0]
+  assert(klass.name === 'AttendanceController', `class name is ${klass.name}`)
+  assert(klass.extends === 'BaseController', `extends is "${klass.extends}"`)
+  assert(klass.implements.includes('InitializingBean'), `implements is ${JSON.stringify(klass.implements)}`)
+  assert(klass.annotations.includes('RestController'), `annotations are ${JSON.stringify(klass.annotations)}`)
+  assert(klass.summary.includes('考勤同步控制器'), `class summary is "${klass.summary}"`)
+
+  assert(entry.fields.some((field) => field.name === 'syncEnabled' && field.type === 'boolean'), 'field missing')
+  assert(entry.fields.find((field) => field.name === 'syncEnabled').comment === '同步开关', 'field comment lost')
+
+  const sync = entry.methods.find((method) => method.name === 'sync')
+  assert(sync !== undefined, `methods are ${entry.methods.map((method) => method.name).join(', ')}`)
+  assert(sync.return_type === 'Result<List<AttendanceResp>>', `return_type is "${sync.return_type}"`)
+  assert(
+    JSON.stringify(sync.parameters) === JSON.stringify(['AttendanceReq req', 'String operator']),
+    `parameters are ${JSON.stringify(sync.parameters)}`
+  )
+  assert(sync.logic_summary.includes('触发一次考勤同步'), `logic_summary is "${sync.logic_summary}"`)
+  assert(sync.key_dependencies.includes('attendanceService'), `dependencies are ${JSON.stringify(sync.key_dependencies)}`)
+
+  const rule = entry.logic_details.find((detail) => detail.description.includes('开始日期不能为空'))
+  assert(rule !== undefined, `logic_details are ${JSON.stringify(entry.logic_details)}`)
+  assert(rule.rule_name.startsWith('sync'), `rule_name is "${rule.rule_name}"`)
+})
+check('a constructor is not mistaken for a method', () => {
+  // The method regex captures modifiers separately from the return type, but a
+  // constructor has no return type: with `\s` in the type group it parsed as a
+  // method named `Foo` returning `public`, and a real method on the next line
+  // was captured with a leading newline plus its modifier.
+  const entry = indexModule.parseJavaSource(
+    [
+      'public class Foo {',
+      '    public Foo(Bar bar) {',
+      '        this.bar = bar;',
+      '    }',
+      '    public String name() {',
+      '        return this.bar.name();',
+      '    }',
+      '}'
+    ].join('\n'),
+    'Foo.java'
+  )
+  assert(
+    entry.methods.every((method) => method.name !== 'Foo'),
+    `a constructor was recorded as a method: ${JSON.stringify(entry.methods)}`
+  )
+  assert(
+    entry.methods.every((method) => !method.return_type.startsWith('\n')),
+    `a return_type swallowed a newline: ${JSON.stringify(entry.methods.map((method) => method.return_type))}`
+  )
+  const name = entry.methods.find((method) => method.name === 'name')
+  assert(name !== undefined, `methods are ${entry.methods.map((method) => method.name).join(', ')}`)
+  assert(name.return_type === 'String', `name() return_type is "${name.return_type}"`)
+})
+check('a MyBatis mapper yields one logic rule per statement', () => {
+  const entry = indexModule.parseXmlMapper(
+    [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">',
+      '<mapper namespace="com.demo.mapper.AttendanceMapper">',
+      '  <select id="selectPage" resultType="AttendanceResp">',
+      '    SELECT * FROM WIP_ATTENDANCE WHERE DEL_FLAG = 0',
+      '  </select>',
+      '  <update id="updateStatus">',
+      '    UPDATE WIP_ATTENDANCE SET STATUS = #{status} WHERE ID = #{id}',
+      '  </update>',
+      '</mapper>'
+    ].join('\n'),
+    'AttendanceMapper.xml'
+  )
+  assert(entry !== null, 'the mapper was not recognised')
+  assert(entry.logic_details.length === 2, `expected 2 statements, got ${entry.logic_details.length}`)
+  assert(
+    entry.logic_details.some((detail) => detail.rule_name === 'select:selectPage'),
+    `rule names are ${entry.logic_details.map((detail) => detail.rule_name).join(', ')}`
+  )
+  assert(entry.classes[0].summary.includes('com.demo.mapper.AttendanceMapper'), 'namespace lost')
+})
+check('a non-mapper XML is not indexed as logic', () => {
+  const entry = indexModule.parseXmlMapper('<project><modelVersion>4.0.0</modelVersion></project>', 'pom.xml')
+  assert(entry === null, 'a pom.xml was parsed as a mapper')
+})
+check('a file summary prefers the Javadoc and cleans the asterisks', () => {
+  const summary = indexModule.summarizeFile(
+    ['package com.demo;', '', '/**', ' * 考勤同步控制器。', ' * 负责把 SAP 的考勤数据拉进来。', ' */', 'public class A {}'].join('\n'),
+    'A.java'
+  )
+  assert(!summary.includes('*'), `summary still carries comment furniture: "${summary}"`)
+  assert(summary.includes('考勤同步控制器'), `summary is "${summary}"`)
+})
+check('an undocumented Java file is summarised by its declaration, not its package line', () => {
+  const summary = indexModule.summarizeFile(
+    ['package com.demo.service;', '', 'public interface AttendanceService {', '    void sync();', '}'].join('\n'),
+    'AttendanceService.java'
+  )
+  assert(summary !== 'package com.demo.service;', 'summary fell through to the package declaration')
+  assert(summary.includes('interface AttendanceService'), `summary is "${summary}"`)
+})
+check('the query finds a class, a method and a rule, and says what to do next', () => {
+  const entry = indexModule.parseJavaSource(
+    ['/** 考勤同步控制器。 */', 'public class AttendanceController {', '    public void sync(AttendanceReq req) {', '        if (req == null) { throw new IllegalArgumentException("x"); }', '    }', '}'].join('\n'),
+    'src/AttendanceController.java'
+  )
+  const index = {
+    project_meta: { project_name: 'demo', last_updated: new Date().toISOString(), file_count: 1, global_summary: '' },
+    directory_index: [
+      { path: 'src', type: 'directory', summary: 'src：1 个文件', children: [{ path: 'src/AttendanceController.java', type: 'file', language: 'Java', summary: '考勤同步控制器。' }] }
+    ],
+    content_logic_index: { 'src/AttendanceController.java': entry }
+  }
+  const hits = indexModule.queryIndex(index, 'attendance', 20)
+  assert(hits.length > 0, 'no hits for a class that plainly exists')
+  assert(hits.some((hit) => hit.kind === 'class'), `kinds are ${[...new Set(hits.map((hit) => hit.kind))].join(', ')}`)
+  assert(hits.some((hit) => hit.kind === 'method'), 'the method was not indexed')
+  const text = indexModule.formatQuery(hits, 'attendance')
+  assert(text.includes('src/AttendanceController.java'), 'the hit text omits the file path')
+  assert(text.includes('action=read'), 'the hit text does not point at action=read')
+})
+check('reading a symbol narrows the entry to that method', () => {
+  const entry = indexModule.parseJavaSource(
+    ['public class A {', '    public void alpha() {}', '    public void beta() {}', '}'].join('\n'),
+    'A.java'
+  )
+  const index = {
+    project_meta: {},
+    directory_index: [{ path: '.', type: 'directory', summary: '', children: [{ path: 'A.java', type: 'file', language: 'Java', summary: '' }] }],
+    content_logic_index: { 'A.java': entry }
+  }
+  const narrowed = indexModule.readIndexEntry(index, 'A.java', 'beta')
+  assert(narrowed.logic.methods.length === 1, `expected 1 method, got ${narrowed.logic.methods.length}`)
+  assert(narrowed.logic.methods[0].name === 'beta', `kept ${narrowed.logic.methods[0].name}`)
+  const text = indexModule.formatRead(narrowed, 'A.java')
+  assert(text.includes('beta'), 'the rendered entry omits the symbol')
+  assert(!text.includes('alpha'), 'the rendered entry still lists the other method')
+})
+check('reading a path the index does not know says so instead of pretending', () => {
+  const index = { project_meta: {}, directory_index: [], content_logic_index: {} }
+  const text = indexModule.formatRead(indexModule.readIndexEntry(index, 'Nope.java'), 'Nope.java')
+  assert(text.includes('索引里没有'), `text is "${text}"`)
+  assert(text.includes('query'), 'the message does not point at action=query')
+})
+check('the tool definition is well-formed', () => {
+  const tool = indexModule.createProjectIndexTool({ resolve: async () => ({ root: '.', service: {} }) })
+  assert(tool.name === 'project_index', `tool name is "${tool.name}"`)
+  assert(typeof tool.description === 'string' && tool.description.length > 100, 'tool description is too thin')
+  assert(tool.parameters?.type === 'object', 'parameters is not an object schema')
+  assert(Array.isArray(tool.parameters?.properties?.action?.enum), 'action has no enum')
+  assert(tool.parameters.properties.action.enum.includes('query'), 'action is missing query')
+  assert(typeof tool.output?.render === 'function', 'output.render is not a function')
+  const rendered = tool.output.render({}, { text: 'hello' })
+  assert(Array.isArray(rendered) && rendered[0].text === 'hello', 'render did not produce a text block')
+})
+check('the tool description carries the contract the model needs', () => {
+  const tool = indexModule.createProjectIndexTool({ resolve: async () => ({ root: '.', service: {} }) })
+  for (const needle of ['.dsh/index/project_index.json', '除非用户明确要求改源码', 'action=query', 'action=read']) {
+    assert(tool.description.includes(needle), `tool description no longer mentions "${needle}"`)
+  }
+})
+check('ignored paths cover the noise and keep the sources', () => {
+  for (const [path, expected] of [
+    ['node_modules/x.java', true],
+    ['.git/config', true],
+    ['target/classes/A.class', true],
+    ['.dsh/index/project_index.json', true],
+    ['src/main/java/A.java', false],
+    ['.gitignore', false]
+  ]) {
+    assert(indexModule.shouldIgnorePath(path) === expected, `shouldIgnorePath("${path}") should be ${expected}`)
+  }
+})
+
 // ── required-without-fallback config ──────────────────────────────────────────
 //
 // These two rows declare their config fields as REQUIRED with no default. A row
@@ -491,6 +776,17 @@ check('the persona row name matches the exported subpath', () => {
   assert(
     PERSONA_ROW === `${PKG.name}/persona-hot`,
     `row name ${PERSONA_ROW} does not match package name ${PKG.name}`
+  )
+})
+check('the project-index row module is shipped and exported as a subpath', () => {
+  assert(files.includes('project-index.js'), 'project-index.js is not in files — the preset row could not import')
+  assert(
+    PKG.exports?.['./project-index'] === './project-index.js',
+    'exports["./project-index"] is missing — the row name would not resolve at mount'
+  )
+  assert(
+    PROJECT_INDEX_ROW === `${PKG.name}/project-index`,
+    `row name ${PROJECT_INDEX_ROW} does not match package name ${PKG.name}`
   )
 })
 check('the patch file is covered by the files whitelist', () => {

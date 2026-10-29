@@ -79,6 +79,16 @@ const COMPANION_PACKAGE = 'dsh-api-test-bundle'
 const PERSONA_HOT_PACKAGE = 'dsh-wip-codegen-agent/persona-hot'
 
 /**
+ * The project-index row this bundle ships itself.
+ *
+ * Owns the composite index at `<project>/.dsh/index/project_index.json` and the
+ * `project_index` tool. A subpath for the same reason as the persona row: the
+ * row resolves through the package `exports` map, so the file the loader mounts
+ * is the file the package publishes.
+ */
+const PROJECT_INDEX_PACKAGE = 'dsh-wip-codegen-agent/project-index'
+
+/**
  * Name of the row that renders the skill catalog and the `skill` tool.
  *
  * The testing companion only *registers* a skill; without this consumer nothing
@@ -288,6 +298,14 @@ export function buildDefinition(warn, options = {}) {
       // directory up to the `.git` root (project), which is exactly the
       // global-plus-per-repository split the spec asks for.
       config: { maxBytes: AGENTS_MAX_BYTES }
+    },
+    {
+      id: 'project-index',
+      name: PROJECT_INDEX_PACKAGE
+      // No config on purpose: the row derives the project root from the
+      // working-directory service, so the same preset indexes whatever
+      // repository the session was opened in. A path in the config would be
+      // cloned at mount and point at the wrong project after a directory change.
     }
   ]
 

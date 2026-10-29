@@ -170,7 +170,7 @@ if (!options.fromGithub) {
     const fingerprint = (root) => {
       const hash = createHash('sha256')
       // The files that decide behaviour: the preset rows and the spec text.
-      for (const rel of ['index.js', 'persona-hot.js', 'assets/wip-codegen/system-prompt.md']) {
+      for (const rel of ['index.js', 'persona-hot.js', 'project-index.js', 'assets/wip-codegen/system-prompt.md']) {
         hash.update(rel)
         hash.update(readFileSync(join(root, rel)))
       }
@@ -266,6 +266,34 @@ if (start === -1 || end === -1) {
       )
     }
   })
+  check('the project-index row is mounted and active', () => {
+    // The row registers a tool and starts a watcher, so a row that mounts but
+    // throws in `apply()` shows up as a non-ACTIVE fiber rather than a missing
+    // row — the generic "every row is active" check above catches that, but
+    // naming it here makes the failure readable.
+    const row = composition.rows.find((entry) => entry.moduleName === `${BUNDLE_PACKAGE}/project-index`)
+    assert(row !== undefined, `no project-index row (rows: ${composition.rows.map((entry) => entry.moduleName).join(', ')})`)
+    assert(row.enabled !== false, 'the project-index row is disabled')
+    assert(row.fiberStateName === 'ACTIVE', `the project-index row is ${String(row.fiberStateName)}`)
+  })
+  check('the project_index tool reaches the model', () => {
+    // ACTIVE only proves `apply()` returned. The row registers its tool through
+    // `ctx.get('tools', false)`, so a silently failed registration would leave
+    // the composition perfect and the model without the tool the spec relies on.
+    assert(observation.tools?.error === undefined, `tools unavailable: ${String(observation.tools?.error)}`)
+    assert(
+      observation.tools.hasProjectIndex,
+      `project_index is not registered (tools: ${observation.tools.names.join(', ')})`
+    )
+    assert(
+      (observation.tools.projectIndexDescriptionLength ?? 0) > 100,
+      `the description is too short to carry the contract (${String(observation.tools.projectIndexDescriptionLength)} chars)`
+    )
+    assert(
+      JSON.stringify(observation.tools.projectIndexActions) === JSON.stringify(['status', 'query', 'read', 'build']),
+      `unexpected actions: ${JSON.stringify(observation.tools.projectIndexActions)}`
+    )
+  })
   check('plan-mode is not mounted', () => {
     assert(!composition.rows.some((row) => row.moduleName.includes('dsh-plan-mode')), 'plan-mode row is mounted')
   })
@@ -351,8 +379,8 @@ if (start === -1 || end === -1) {
   console.log('spec text carried by the persona')
   check('the installed bundle reports its own definition', () => {
     assert(!observation.bundle?.error, String(observation.bundle?.error))
-    assert(observation.bundle.rowCount === 10, `rowCount = ${String(observation.bundle?.rowCount)}`)
-    assert(observation.bundle.flatRowCount === 15, `flatRowCount = ${String(observation.bundle?.flatRowCount)}`)
+    assert(observation.bundle.rowCount === 11, `rowCount = ${String(observation.bundle?.rowCount)}`)
+    assert(observation.bundle.flatRowCount === 16, `flatRowCount = ${String(observation.bundle?.flatRowCount)}`)
   })
   check('the spec carries the SQL, confirmation and global-rule sections', () => {
     assert(observation.bundle.specHasSqlSection, 'SQL section missing')

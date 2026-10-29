@@ -1,8 +1,8 @@
 {
   "name": "dsh-wip-codegen-agent",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "private": true,
-  "description": "DSH bundle: registers the 'wip-codegen' Agent preset — a WIP/HRP agent that generates SQL Server table scripts and Spring Boot 3 + MyBatis-Plus code under an explicit user-confirmation flow, with the api-test interface-testing skill mounted, a hot-reloading prompt body, AGENTS.md loading, and subagent/workflow delegation for multi-file work.",
+  "description": "DSH bundle: registers the 'wip-codegen' Agent preset — a WIP/HRP agent that generates SQL Server table scripts and Spring Boot 3 + MyBatis-Plus code under an explicit user-confirmation flow, with a composite project index at .dsh/index/project_index.json maintained by a background listener, the api-test interface-testing skill mounted, a hot-reloading prompt body, AGENTS.md loading, and subagent/workflow delegation for multi-file work.",
   "keywords": [
     "dsh",
     "dsh-bundle",
@@ -15,6 +15,7 @@
     "sql-server",
     "ddl",
     "api-test",
+    "project-index",
     "wip",
     "hrp"
   ],
@@ -32,11 +33,13 @@
   "exports": {
     ".": "./index.js",
     "./persona-hot": "./persona-hot.js",
+    "./project-index": "./project-index.js",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
     "persona-hot.js",
+    "project-index.js",
     "cordis.patch.yml",
     "assets",
     "verify.mjs",

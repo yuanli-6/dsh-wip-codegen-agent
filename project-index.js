@@ -1,0 +1,1969 @@
+/**
+ * Composite project index: the `.dsh/index/project_index.json` that §十七 of the
+ * spec tells the Agent to trust before it reads any source file.
+ *
+ * Three pieces live here.
+ *
+ * 1. A deterministic extractor. Every field of the index is derived from file
+ *    bytes by plain JavaScript: a directory walk, a brace-aware Java scanner,
+ *    and a MyBatis statement scan. Nothing in here calls a model.
+ *
+ * 2. A background listener. It starts itself the first time an Agent runs a
+ *    step, rebuilds when the 30-minute lease has expired, and rebuilds again
+ *    (incrementally) when the watched tree changes. It never asks the user
+ *    anything, never posts into the conversation, and never blocks a step.
+ *
+ * 3. The `project_index` tool, which is the only way the model is meant to
+ *    spend tokens on project structure: `status` first, then `query` or `read`.
+ *
+ * Why not a real subagent: the spec calls the listener a "后台监听器子代理",
+ * and that word normally means `subagents.startActivation`. A spawned child
+ * here would inherit this preset — which means every 30 minutes it would load
+ * the whole 40 KB spec (≈12k tokens) to produce a deterministic artefact, it
+ * would deliver its result into the parent conversation through
+ * `delivery: 'parent'` and so break the "silent" requirement, and it would
+ * mount this very row again, so it would have to be gated against recursing
+ * into a listener of its own. The role the spec wants — owned lifecycle, full
+ * build, incremental build, conflict skip — is a job, not a conversation. This
+ * module therefore runs that job in the host plugin and says so plainly in the
+ * README instead of pretending a child agent is doing it.
+ *
+ * @module dsh-wip-codegen-agent/project-index
+ */
+
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, watch } from 'node:fs'
+import { readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, extname, join } from 'node:path'
+
+/** Cordis plugin name; also the patch row id. */
+export const name = 'wip-codegen-project-index'
+
+/**
+ * `tools` is a hard dependency: this row's whole point is the `project_index`
+ * tool, and a registration that silently no-ops is worse than a row that waits.
+ *
+ * Do NOT look `tools` up with `ctx.get('tools', false)` inside `apply()`: at
+ * activation time the Service is often not on the context yet, the lookup
+ * returns nothing, and the only retry used to hang off `agent/pre-step` — so a
+ * profile that mounts the preset without ever running a step (exactly what the
+ * runtime probe does) ends up with a perfect-looking composition, every row
+ * ACTIVE, and no tool for the model. `verify-runtime` caught this.
+ *
+ * The object form `{ required, optional }` is NOT valid: cordis reads the keys
+ * as Service *names*, so the plugin waits forever for services called
+ * `required` and `optional` and sits PENDING. Only the array form is understood.
+ *
+ * `workingDirectory` stays optional and lazy — without it the root falls back to
+ * `process.cwd()`, which is still useful.
+ */
+export const inject = ['tools']
+
+/** Directory (relative to the project root) that holds every generated artefact. */
+export const INDEX_DIR = '.dsh/index'
+
+/** The index itself. Path fixed by the spec. */
+export const INDEX_FILE = 'project_index.json'
+
+/** The index path as the spec writes it, relative to the project root. */
+export const INDEX_RELATIVE_PATH = `${INDEX_DIR}/${INDEX_FILE}`
+
+/**
+ * Sidecar holding per-file hashes.
+ *
+ * Deliberately *not* inside `project_index.json`: the spec pins that file's
+ * three top-level keys, and a per-file hash table is bookkeeping, not project
+ * knowledge. Keeping it separate also means the index stays diff-friendly.
+ */
+export const CACHE_FILE = 'file-cache.json'
+
+/** Bumped when the extractor's output shape changes, so old caches are ignored. */
+export const INDEX_VERSION = 1
+
+/** Listener lease. The spec's "有效期 30 分钟". */
+export const LEASE_MS = 30 * 60 * 1000
+
+/** Watch debounce: a Maven build touches hundreds of paths in a burst. */
+export const DEBOUNCE_MS = 1200
+
+/**
+ * A file touched this recently is assumed to be mid-write.
+ *
+ * The spec's "冲突处理：文件正在被修改则跳过本次". Reading a half-written
+ * Java file yields a half-parsed class, which is worse than a stale entry.
+ */
+export const SETTLE_MS = 1500
+
+/** Files above this size are recorded in the directory index but not parsed. */
+export const MAX_FILE_BYTES = 512 * 1024
+
+/** Hard ceiling on the walk, so a runaway tree cannot wedge the listener. */
+export const MAX_FILES = 20000
+
+/** Directories that never hold hand-written source. */
+export const SKIP_DIRS = new Set([
+  'node_modules',
+  'target',
+  'build',
+  'dist',
+  'out',
+  'bin',
+  'obj',
+  'coverage',
+  'logs',
+  'log',
+  'tmp',
+  'temp',
+  'vendor',
+  'generated',
+  '.git',
+  '.dsh',
+  '.idea',
+  '.vscode',
+  '.gradle',
+  '.mvn',
+  '.settings',
+  '.cache'
+])
+
+/** Extension → language label used in `directory_index[].children[].language`. */
+const LANGUAGE_BY_EXT = new Map([
+  ['.java', 'Java'],
+  ['.kt', 'Kotlin'],
+  ['.groovy', 'Groovy'],
+  ['.gradle', 'Gradle'],
+  ['.xml', 'XML'],
+  ['.sql', 'SQL'],
+  ['.yml', 'YAML'],
+  ['.yaml', 'YAML'],
+  ['.json', 'JSON'],
+  ['.properties', 'Properties'],
+  ['.md', 'Markdown'],
+  ['.js', 'JavaScript'],
+  ['.mjs', 'JavaScript'],
+  ['.cjs', 'JavaScript'],
+  ['.ts', 'TypeScript'],
+  ['.vue', 'Vue'],
+  ['.html', 'HTML'],
+  ['.htm', 'HTML'],
+  ['.css', 'CSS'],
+  ['.scss', 'SCSS'],
+  ['.less', 'LESS'],
+  ['.sh', 'Shell'],
+  ['.ps1', 'PowerShell'],
+  ['.bat', 'Batch'],
+  ['.cmd', 'Batch'],
+  ['.py', 'Python'],
+  ['.go', 'Go'],
+  ['.rs', 'Rust'],
+  ['.c', 'C'],
+  ['.h', 'C'],
+  ['.cpp', 'C++'],
+  ['.cs', 'C#'],
+  ['.php', 'PHP']
+])
+
+/** Per-file caps, so one pathological file cannot dominate the artefact. */
+const MAX_CLASSES = 40
+const MAX_FIELDS = 120
+const MAX_METHODS = 200
+const MAX_DETAILS_PER_METHOD = 8
+const MAX_DETAILS_PER_FILE = 60
+const MAX_DEPENDENCIES = 8
+const SUMMARY_MAX = 200
+const LOGIC_MAX = 160
+
+// ---------------------------------------------------------------------------
+// paths
+// ---------------------------------------------------------------------------
+
+/** Normalise to forward slashes, drop a leading `./`, and trim trailing slashes. */
+export function toPosix(value) {
+  return String(value ?? '')
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+$/, '')
+}
+
+/** Directory portion of a relative file path; `.` for files at the root. */
+export function dirOf(relPath) {
+  const posix = toPosix(relPath)
+  const cut = posix.lastIndexOf('/')
+  return cut < 0 ? '.' : posix.slice(0, cut)
+}
+
+/**
+ * Walk up from `start` looking for the repository root marker.
+ *
+ * The index lives at the project root, not at whatever directory the Agent
+ * happens to be in. `.git` is the same marker `agent-instructions` uses to
+ * decide where `AGENTS.md` stops, so both features agree on "project".
+ *
+ * @param {string} start - directory to start from.
+ * @returns {string} the root, or `start` when no marker is found.
+ */
+export function findProjectRoot(start) {
+  let current = start
+  for (let depth = 0; depth < 64; depth += 1) {
+    if (existsSync(join(current, '.git'))) return current
+    const parent = dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return start
+}
+
+/**
+ * Absolute paths of the three artefacts.
+ *
+ * @param {string} root - project root.
+ * @returns {{dir: string, index: string, cache: string}} absolute paths.
+ */
+export function indexPaths(root) {
+  const dir = join(root, ...INDEX_DIR.split('/'))
+  return { dir, index: join(dir, INDEX_FILE), cache: join(dir, CACHE_FILE) }
+}
+
+/**
+ * Language label for a relative path.
+ *
+ * @param {string} relPath - path relative to the project root.
+ * @returns {string} a label such as `Java`, or `Text` when unknown.
+ */
+export function languageOf(relPath) {
+  return LANGUAGE_BY_EXT.get(extname(toPosix(relPath)).toLowerCase()) ?? 'Text'
+}
+
+// ---------------------------------------------------------------------------
+// walking
+// ---------------------------------------------------------------------------
+
+/** Whether a path segment list should be skipped entirely. */
+function isSkippedSegment(segment) {
+  if (segment === '' || segment === '.') return false
+  if (SKIP_DIRS.has(segment)) return true
+  return segment.startsWith('.') && segment !== '.gitignore'
+}
+
+/**
+ * Whether a path relative to the root should be ignored.
+ *
+ * @param {string} relPath - path relative to the project root.
+ * @returns {boolean} true when the path is build output, VCS metadata, or hidden.
+ */
+export function shouldIgnorePath(relPath) {
+  return toPosix(relPath)
+    .split('/')
+    .some((segment) => isSkippedSegment(segment))
+}
+
+/**
+ * Collect every source file under `root`, relative and sorted.
+ *
+ * Symlinks are not followed: a linked `node_modules` would otherwise turn the
+ * walk into a cycle, and the index only needs what lives in this checkout.
+ *
+ * @param {string} root - project root.
+ * @param {{maxFiles?: number}} [options] - walk limits.
+ * @returns {Promise<string[]>} relative paths using `/`.
+ */
+export async function walkSourceFiles(root, options = {}) {
+  const maxFiles = options.maxFiles ?? MAX_FILES
+  /** @type {string[]} */
+  const files = []
+
+  /** @param {string} directory @param {string} prefix */
+  async function visit(directory, prefix) {
+    if (files.length >= maxFiles) return
+    let entries
+    try {
+      entries = await readdir(directory, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (files.length >= maxFiles) return
+      if (isSkippedSegment(entry.name)) continue
+      const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`
+      if (entry.isDirectory()) {
+        await visit(join(directory, entry.name), rel)
+        continue
+      }
+      if (!entry.isFile()) continue
+      files.push(rel)
+    }
+  }
+
+  await visit(root, '')
+  files.sort()
+  return files
+}
+
+// ---------------------------------------------------------------------------
+// text helpers
+// ---------------------------------------------------------------------------
+
+/** Collapse every whitespace run to one space. */
+function collapse(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim()
+}
+
+/** Collapse whitespace and cut to `max` characters. */
+function truncate(text, max = SUMMARY_MAX) {
+  const flat = collapse(text)
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`
+}
+
+/**
+ * Whether a comment line is pure decoration.
+ *
+ * Banner comments are everywhere in this codebase
+ * (`// ===== 任务安排 → 出勤记录映射 =====`), and the banner text itself is a
+ * useful summary — the `=====` runs are not. A line whose only content is
+ * punctuation carries nothing, so it is dropped instead of collapsed into the
+ * summary.
+ */
+function isDecorationLine(line) {
+  return line.replace(/[=\-*#/_~+<>|.\s]/g, '') === ''
+}
+
+/** Strip comment furniture (`/**`, `*`, `//`, `--`, `<!--`) from one block. */
+function cleanComment(text) {
+  const lines = String(text ?? '')
+    .split('\n')
+    .map((line) =>
+      line
+        .replace(/\/\*+/, ' ')
+        .replace(/\*+\//, ' ')
+        .replace(/<!--/, ' ')
+        .replace(/-->/, ' ')
+        .replace(/^\s*\*+/, ' ')
+        .replace(/^\s*\/\/+/, ' ')
+        .replace(/^\s*#+/, ' ')
+        .replace(/^\s*--+/, ' ')
+        .replace(/^[=\-*#_~+\s]+/, '')
+        .replace(/[=\-*#_~+\s]+$/, '')
+    )
+    .filter((line) => !isDecorationLine(line))
+  return collapse(lines.join(' '))
+}
+
+/**
+ * The comment block directly above a declaration line.
+ *
+ * Annotation lines are skipped first: in this codebase the Javadoc sits above
+ * `@RestController`, not directly above `public class`.
+ *
+ * @param {string[]} lines - file split on newlines.
+ * @param {number} lineIndex - 0-based line of the declaration.
+ * @returns {string} the comment text, or `''`.
+ */
+function commentAbove(lines, lineIndex) {
+  let index = lineIndex - 1
+  const skipAnnotations = () => {
+    while (index >= 0 && lines[index].trim().startsWith('@')) index -= 1
+  }
+  skipAnnotations()
+  while (index >= 0 && lines[index].trim() === '') {
+    index -= 1
+    skipAnnotations()
+  }
+  if (index < 0) return ''
+
+  const line = lines[index].trim()
+  if (line.endsWith('*/')) {
+    const block = []
+    while (index >= 0) {
+      block.unshift(lines[index])
+      if (lines[index].includes('/*')) break
+      index -= 1
+    }
+    return cleanComment(block.join('\n'))
+  }
+  if (line.startsWith('//')) {
+    const block = []
+    while (index >= 0 && lines[index].trim().startsWith('//')) {
+      block.unshift(lines[index])
+      index -= 1
+    }
+    return cleanComment(block.join('\n'))
+  }
+  return ''
+}
+
+/** Line-start offsets, for turning a match index into a line number. */
+function lineStarts(source) {
+  const starts = [0]
+  for (let i = 0; i < source.length; i += 1) {
+    if (source[i] === '\n') starts.push(i + 1)
+  }
+  return starts
+}
+
+/** 0-based line containing `offset`. */
+function lineAt(starts, offset) {
+  let low = 0
+  let high = starts.length - 1
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (starts[middle] <= offset) low = middle
+    else high = middle - 1
+  }
+  return low
+}
+
+/** Index just past the string literal that starts at `start`. */
+function skipString(source, start) {
+  const quote = source[start]
+  let index = start + 1
+  while (index < source.length) {
+    const char = source[index]
+    if (char === '\\') {
+      index += 2
+      continue
+    }
+    if (char === quote) return index + 1
+    if (char === '\n') return index + 1
+    index += 1
+  }
+  return source.length
+}
+
+/**
+ * The `{ … }` block that follows `from`, with strings and comments ignored.
+ *
+ * @param {string} source - the whole file.
+ * @param {number} from - offset to start searching at.
+ * @returns {{start: number, end: number, body: string} | null} the block, or null.
+ */
+function scanBlock(source, from) {
+  const open = source.indexOf('{', from)
+  if (open < 0) return null
+  let depth = 0
+  let index = open
+  while (index < source.length) {
+    const char = source[index]
+    if (char === '"' || char === "'") {
+      index = skipString(source, index)
+      continue
+    }
+    if (char === '/' && source[index + 1] === '/') {
+      const newline = source.indexOf('\n', index)
+      index = newline < 0 ? source.length : newline + 1
+      continue
+    }
+    if (char === '/' && source[index + 1] === '*') {
+      const close = source.indexOf('*/', index + 2)
+      index = close < 0 ? source.length : close + 2
+      continue
+    }
+    if (char === '{') depth += 1
+    else if (char === '}') {
+      depth -= 1
+      if (depth === 0) {
+        return { start: open + 1, end: index, body: source.slice(open + 1, index) }
+      }
+    }
+    index += 1
+  }
+  return { start: open + 1, end: source.length, body: source.slice(open + 1) }
+}
+
+// ---------------------------------------------------------------------------
+// Java
+// ---------------------------------------------------------------------------
+
+/** Tokens that can never be part of a declared type. */
+const JAVA_KEYWORDS = new Set([
+  'if',
+  'for',
+  'while',
+  'switch',
+  'catch',
+  'return',
+  'new',
+  'throw',
+  'throws',
+  'else',
+  'do',
+  'try',
+  'finally',
+  'synchronized',
+  'assert',
+  'case',
+  'default',
+  'super',
+  'this',
+  'instanceof',
+  'yield',
+  'await',
+  'break',
+  'continue'
+])
+
+/**
+ * Modifiers that can be mistaken for a return type.
+ *
+ * `METHOD_RE` captures modifiers into group 1 and the type into group 2, but a
+ * constructor has no return type at all: `public Foo(Bar bar)` matches with an
+ * empty group 1 and `public` sitting in group 2, which would be recorded as a
+ * method named `Foo` returning `public`. Rejecting a type made only of
+ * modifiers drops those rows.
+ */
+const JAVA_MODIFIERS = new Set([
+  'public',
+  'protected',
+  'private',
+  'static',
+  'final',
+  'abstract',
+  'synchronized',
+  'native',
+  'default',
+  'strictfp',
+  'transient',
+  'volatile'
+])
+
+/** `@Foo` / `@Foo(...)` prefixes before a declaration. */
+const ANNOTATION_PREFIX = String.raw`(?:@[\w.]+(?:\((?:[^()]|\([^()]*\))*\))?[ \t]*)*`
+
+/** Class-like declaration header. */
+const CLASS_RE = new RegExp(
+  String.raw`^[ \t]*${ANNOTATION_PREFIX}` +
+    String.raw`((?:(?:public|protected|private|static|final|abstract|sealed|strictfp)\s+)*)` +
+    String.raw`(class|interface|enum|record)\s+(\w+)([^{;]*)\{`,
+  'gm'
+)
+
+/** Field declaration, modifiers mandatory so locals are not picked up. */
+const FIELD_RE = new RegExp(
+  String.raw`^[ \t]*${ANNOTATION_PREFIX}` +
+    String.raw`(?:(?:private|protected|public|static|final|transient|volatile)\s+)+` +
+    String.raw`([\w$.<>\[\], \t?]+?)[ \t]+(\w+)\s*(?:=[^;]*)?;`,
+  'gm'
+)
+
+/**
+ * Method declaration; the type may not contain a Java keyword.
+ *
+ * The type is captured with `[ \t]` rather than `\s` on purpose. With `\s` the
+ * lazy group happily swallowed a newline plus the next line's modifier, so
+ * `public Foo(...)` parsed as a method named `Foo` returning `public`, and a
+ * real method on the following line was captured as
+ * `"\n    public Result<…>"`. Staying inside one line makes a constructor — no
+ * return type, no space before `(` — simply not match.
+ */
+const METHOD_RE = new RegExp(
+  String.raw`^[ \t]*${ANNOTATION_PREFIX}` +
+    String.raw`((?:(?:public|protected|private|static|final|abstract|synchronized|native|default|strictfp)\s+)*)` +
+    String.raw`([\w$.<>\[\], \t?]+?)[ \t]+([\w$]+)\s*\(((?:[^()]|\([^()]*\))*)\)`,
+  'gm'
+)
+
+/** Annotation name + raw argument text, used for class annotations. */
+const ANNOTATION_RE = /@([\w.]+)(?:\(((?:[^()]|\([^()]*\))*)\))?/g
+
+/**
+ * Split a parameter list on top-level commas.
+ *
+ * @param {string} raw - text between the parentheses.
+ * @returns {string[]} one `"类型 参数名"` string per parameter.
+ */
+export function parseParameters(raw) {
+  const text = collapse(raw)
+  if (text === '') return []
+
+  /** @type {string[]} */
+  const parts = []
+  let depth = 0
+  let buffer = ''
+  for (const char of text) {
+    if (char === '<') depth += 1
+    else if (char === '>') depth = Math.max(0, depth - 1)
+    if (char === ',' && depth === 0) {
+      parts.push(buffer)
+      buffer = ''
+      continue
+    }
+    buffer += char
+  }
+  if (buffer.trim() !== '') parts.push(buffer)
+
+  return parts.map((part) => {
+    const cleaned = collapse(
+      part
+        .replace(/@[\w.]+(?:\((?:[^()]|\([^()]*\))*\))?/g, ' ')
+        .replace(/\bfinal\s+/g, ' ')
+    )
+    const matched = /^(.*?)\s*([\w$]+)$/.exec(cleaned)
+    if (!matched) return cleaned
+    const type = collapse(matched[1])
+    return type === '' ? matched[2] : `${type} ${matched[2]}`
+  })
+}
+
+/** Whether a captured type is really a keyword-led expression. */
+function isPlausibleType(type) {
+  const tokens = collapse(type)
+    .split(/[^\w$]+/)
+    .filter((token) => token !== '')
+  if (tokens.length === 0) return false
+  return tokens.every((token) => !JAVA_KEYWORDS.has(token) && !JAVA_MODIFIERS.has(token))
+}
+
+/** `extends A` / `implements B, C` from a class header. */
+function parseHeritage(header) {
+  const flat = collapse(header)
+  const extendsMatch = /\bextends\s+([\w$.<>,\s?]+?)(?=\bimplements\b|$)/.exec(flat)
+  const implementsMatch = /\bimplements\s+([\w$.<>,\s?]+)$/.exec(flat)
+  const split = (value) =>
+    value === undefined
+      ? []
+      : value
+          .split(',')
+          .map((item) => collapse(item))
+          .filter((item) => item !== '')
+  return { extends: split(extendsMatch?.[1]), implements: split(implementsMatch?.[1]) }
+}
+
+/** First meaningful statement of a method body, preferring a `return`. */
+function firstStatement(body) {
+  const lines = body
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(
+      (line) =>
+        line !== '' &&
+        line !== '{' &&
+        line !== '}' &&
+        !line.startsWith('//') &&
+        !line.startsWith('*') &&
+        !line.startsWith('/*')
+    )
+  const isReturn = (line) => line.startsWith('return ') || line.startsWith('return;')
+  // A line that ends mid-expression (`return new Foo() {`) describes an
+  // anonymous class opener, not the method's work; prefer a statement that
+  // closes on its own line before falling back to whatever came first.
+  const returning = lines.find((line) => isReturn(line) && line.endsWith(';'))
+  const complete = lines.find((line) => line.endsWith(';') && !line.startsWith('}'))
+  const chosen = returning ?? complete ?? lines.find(isReturn) ?? lines[0] ?? ''
+  return truncate(chosen.replace(/;$/, '').replace(/[\s{]+$/, ''), LOGIC_MAX)
+}
+
+/** Capitalised types and `*Mapper` / `*Service` style collaborators used in a body. */
+function collectDependencies(body) {
+  /** @type {string[]} */
+  const found = []
+  const seen = new Set()
+  const push = (value) => {
+    if (value === undefined || value === '') return
+    if (seen.has(value)) return
+    seen.add(value)
+    found.push(value)
+  }
+
+  for (const matched of body.matchAll(/\b([A-Z][\w$]*)\s*(?:\.|::|<)/g)) push(matched[1])
+  for (const matched of body.matchAll(/\b(\w*(?:Mapper|Service|Repository|Dao|Util|Helper))\b/g)) {
+    push(matched[1])
+  }
+  return found.slice(0, MAX_DEPENDENCIES)
+}
+
+/** `if (cond) { action }` pairs from a method body. */
+function collectRules(body, methodName) {
+  /** @type {{rule_name: string, description: string}[]} */
+  const rules = []
+  const lines = body.split('\n')
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim()
+    const condition = /^(?:\}\s*)?if\s*\((.+)\)\s*\{?$/.exec(line)
+    if (condition === null) continue
+    let action = ''
+    for (let next = index + 1; next < Math.min(index + 4, lines.length); next += 1) {
+      const candidate = lines[next].trim()
+      if (candidate === '' || candidate === '{' || candidate === '}') continue
+      action = candidate.replace(/;$/, '')
+      break
+    }
+    if (action === '') continue
+    rules.push({
+      rule_name: `${methodName} · 条件 ${rules.length + 1}`,
+      description: truncate(`${collapse(condition[1])} → ${action}`, LOGIC_MAX)
+    })
+    if (rules.length >= MAX_DETAILS_PER_METHOD) break
+  }
+  return rules
+}
+
+/**
+ * Extract the `content_logic_index` entry for one Java file.
+ *
+ * @param {string} source - file text.
+ * @param {string} relPath - path relative to the project root.
+ * @returns {{classes: object[], fields: object[], methods: object[], logic_details: object[]}} the entry.
+ */
+export function parseJavaSource(source, relPath) {
+  const text = source.replace(/^\uFEFF/, '')
+  const lines = text.split('\n')
+  const starts = lineStarts(text)
+
+  /** @type {object[]} */
+  const classes = []
+  for (const matched of text.matchAll(CLASS_RE)) {
+    if (classes.length >= MAX_CLASSES) break
+    const index = lineAt(starts, matched.index ?? 0)
+    const heritage = parseHeritage(matched[4] ?? '')
+    const annotations = []
+    for (let up = index - 1; up >= 0 && lines[up].trim().startsWith('@'); up -= 1) {
+      for (const annotation of lines[up].matchAll(ANNOTATION_RE)) annotations.unshift(annotation[1])
+    }
+    const doc = commentAbove(lines, index)
+    classes.push({
+      name: matched[3],
+      extends: heritage.extends[0] ?? '',
+      implements: heritage.implements,
+      annotations,
+      summary:
+        doc !== ''
+          ? doc
+          : truncate(
+              [
+                matched[2],
+                matched[3],
+                heritage.extends.length > 0 ? `extends ${heritage.extends.join(', ')}` : '',
+                heritage.implements.length > 0 ? `implements ${heritage.implements.join(', ')}` : ''
+              ]
+                .filter((part) => part !== '')
+                .join(' ')
+            )
+    })
+  }
+
+  /** @type {object[]} */
+  const fields = []
+  for (const matched of text.matchAll(FIELD_RE)) {
+    if (fields.length >= MAX_FIELDS) break
+    const type = collapse(matched[1])
+    if (!isPlausibleType(type)) continue
+    const index = lineAt(starts, matched.index ?? 0)
+    fields.push({
+      name: matched[2],
+      type,
+      comment: commentAbove(lines, index)
+    })
+  }
+
+  /** @type {object[]} */
+  const methods = []
+  /** @type {object[]} */
+  const logicDetails = []
+  for (const matched of text.matchAll(METHOD_RE)) {
+    if (methods.length >= MAX_METHODS) break
+    const type = collapse(matched[2])
+    if (!isPlausibleType(type)) continue
+    const name = matched[3]
+    if (JAVA_KEYWORDS.has(name)) continue
+    const offset = (matched.index ?? 0) + matched[0].length
+    const index = lineAt(starts, matched.index ?? 0)
+
+    // A `;` before the next `{` means an abstract / interface method.
+    const semi = text.indexOf(';', offset)
+    const brace = text.indexOf('{', offset)
+    const block = semi >= 0 && (brace < 0 || semi < brace) ? null : scanBlock(text, offset)
+
+    const body = block?.body ?? ''
+    const doc = commentAbove(lines, index)
+    const dependencies = collectDependencies(body)
+    methods.push({
+      name,
+      parameters: parseParameters(matched[4] ?? ''),
+      return_type: type,
+      logic_summary: doc !== '' ? doc : firstStatement(body),
+      key_dependencies: dependencies
+    })
+
+    if (body !== '' && logicDetails.length < MAX_DETAILS_PER_FILE) {
+      logicDetails.push(...collectRules(body, name))
+    }
+  }
+
+  return {
+    classes,
+    fields,
+    methods,
+    logic_details: logicDetails.slice(0, MAX_DETAILS_PER_FILE)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MyBatis XML
+// ---------------------------------------------------------------------------
+
+/** `<select|insert|update|delete id="…">` inside a mapper file. */
+const STATEMENT_RE = /<(select|insert|update|delete)\s+([^>]*?)id\s*=\s*"([^"]+)"[^>]*>/gi
+
+/**
+ * Extract the entry for a MyBatis mapper file.
+ *
+ * Statement ids are the project's real "core logic" for persistence: which
+ * query backs which method. They are the reason a Mapper XML is worth indexing
+ * at all, so each one becomes a `logic_details` rule.
+ *
+ * @param {string} source - file text.
+ * @param {string} relPath - path relative to the project root.
+ * @returns {{classes: object[], fields: object[], methods: object[], logic_details: object[]} | null} the entry, or null when this is not a mapper.
+ */
+export function parseXmlMapper(source, relPath) {
+  const text = source.replace(/^\uFEFF/, '')
+  if (!/<mapper\b/i.test(text)) return null
+  const namespace = /<mapper\b[^>]*namespace\s*=\s*"([^"]+)"/i.exec(text)?.[1] ?? ''
+
+  /** @type {{rule_name: string, description: string}[]} */
+  const details = []
+  for (const matched of text.matchAll(STATEMENT_RE)) {
+    if (details.length >= MAX_DETAILS_PER_FILE) break
+    const tag = matched[1].toLowerCase()
+    const id = matched[3]
+    const start = (matched.index ?? 0) + matched[0].length
+    const close = text.indexOf('</', start)
+    const sql = collapse(text.slice(start, close < 0 ? Math.min(start + 400, text.length) : close))
+    details.push({
+      rule_name: `${tag}:${id}`,
+      description: truncate(`${namespace === '' ? '' : `${namespace.split('.').pop()}.`}${id} — ${sql}`, LOGIC_MAX)
+    })
+  }
+
+  return {
+    classes:
+      namespace === ''
+        ? []
+        : [
+            {
+              name: namespace.split('.').pop() ?? namespace,
+              extends: '',
+              implements: [],
+              annotations: ['MyBatisMapper'],
+              summary: `MyBatis Mapper · namespace ${namespace}`
+            }
+          ],
+    fields: [],
+    methods: [],
+    logic_details: details
+  }
+}
+
+/**
+ * The `content_logic_index` entry for any file, or null when the file carries
+ * no structure worth indexing.
+ *
+ * @param {string} source - file text.
+ * @param {string} relPath - path relative to the project root.
+ * @returns {object | null} the entry, or null.
+ */
+export function extractContentLogic(source, relPath) {
+  const language = languageOf(relPath)
+  if (language === 'Java') {
+    const entry = parseJavaSource(source, relPath)
+    return entry.classes.length === 0 && entry.methods.length === 0 ? null : entry
+  }
+  if (language === 'XML') return parseXmlMapper(source, relPath)
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// summaries
+// ---------------------------------------------------------------------------
+
+/**
+ * A structural one-liner for an undocumented Java declaration.
+ *
+ * @param {string[]} lines - file split on newlines.
+ * @param {number} startIndex - line of the first declaration / annotation.
+ * @returns {string} e.g. `interface AttendanceService`, or `''`.
+ */
+function javaHeaderSummary(lines, startIndex) {
+  for (let index = startIndex; index < Math.min(startIndex + 20, lines.length); index += 1) {
+    const line = lines[index].trim()
+    const matched = /^(?:(?:public|protected|private|static|final|abstract|sealed|strictfp)\s+)*(class|interface|enum|record)\s+([\w$]+)([^{;]*)/.exec(line)
+    if (matched === null) continue
+    const heritage = parseHeritage(matched[3] ?? '')
+    return [
+      `${matched[1]} ${matched[2]}`,
+      heritage.extends.length > 0 ? `extends ${heritage.extends.join(', ')}` : '',
+      heritage.implements.length > 0 ? `implements ${heritage.implements.join(', ')}` : ''
+    ]
+      .filter((part) => part !== '')
+      .join(' ')
+  }
+  return ''
+}
+
+/**
+ * One-line summary for a file, used in `directory_index`.
+ *
+ * Prefers a leading comment block, then a `<mapper namespace>`, then the first
+ * non-blank line. Purely structural: the listener has no model to ask.
+ *
+ * @param {string} source - file text.
+ * @param {string} relPath - path relative to the project root.
+ * @returns {string} at most `SUMMARY_MAX` characters.
+ */
+export function summarizeFile(source, relPath) {
+  const text = source.replace(/^\uFEFF/, '')
+  const language = languageOf(relPath)
+
+  if (language === 'XML') {
+    const namespace = /<mapper\b[^>]*namespace\s*=\s*"([^"]+)"/i.exec(text)?.[1]
+    if (namespace !== undefined) return truncate(`MyBatis Mapper · ${namespace}`)
+  }
+
+  const lines = text.split('\n')
+  if (language === 'Java') {
+    const first = lines.findIndex((line) => /^[ \t]*@|^[ \t]*(?:public|protected|private|abstract|final)\b|^[ \t]*(?:class|interface|enum|record)\b/.test(line))
+    if (first >= 0) {
+      const doc = commentAbove(lines, first)
+      if (doc !== '') return truncate(doc)
+      // No Javadoc. Describe the declaration itself rather than falling through
+      // to the first non-blank line, which for an undocumented interface is
+      // `package com.demo.service;` — technically the first line, useless as a
+      // summary.
+      const header = javaHeaderSummary(lines, first)
+      if (header !== '') return truncate(header)
+    }
+  }
+
+  // A leading comment block, in whichever syntax the file uses.
+  const head = []
+  for (const line of lines.slice(0, 40)) {
+    const trimmed = line.trim()
+    if (trimmed === '') {
+      if (head.length > 0) break
+      continue
+    }
+    const isComment =
+      trimmed.startsWith('//') ||
+      trimmed.startsWith('/*') ||
+      trimmed.startsWith('*') ||
+      trimmed.startsWith('#') ||
+      trimmed.startsWith('--') ||
+      trimmed.startsWith('<!--')
+    if (!isComment) {
+      if (head.length > 0) break
+      return truncate(trimmed)
+    }
+    head.push(trimmed)
+    if (trimmed.includes('*/') || trimmed.includes('-->')) break
+  }
+  if (head.length > 0) {
+    const cleaned = cleanComment(head.join('\n'))
+    if (cleaned !== '') return truncate(cleaned)
+  }
+
+  const firstContent = lines.map((line) => line.trim()).find((line) => line !== '')
+  return truncate(firstContent ?? '')
+}
+
+/**
+ * Structural summary for one directory.
+ *
+ * @param {string} relDir - directory path relative to the project root.
+ * @param {object[]} children - its file entries.
+ * @returns {string} the summary.
+ */
+export function summarizeDirectory(relDir, children) {
+  const counts = new Map()
+  for (const child of children) {
+    counts.set(child.language, (counts.get(child.language) ?? 0) + 1)
+  }
+  const languages = [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 4)
+    .map(([language, count]) => `${language} ${count}`)
+    .join('、')
+  const label = relDir === '.' ? '项目根目录' : relDir
+  return truncate(`${label}：${children.length} 个文件（${languages}）`)
+}
+
+// ---------------------------------------------------------------------------
+// building
+// ---------------------------------------------------------------------------
+
+/**
+ * An index with no content, used when nothing has been built yet.
+ *
+ * @param {string} projectName - value for `project_meta.project_name`.
+ * @returns {object} an empty but structurally valid index.
+ */
+export function emptyIndex(projectName) {
+  return {
+    project_meta: {
+      project_name: projectName,
+      last_updated: '',
+      file_count: 0,
+      global_summary: '索引尚未构建。'
+    },
+    directory_index: [],
+    content_logic_index: {}
+  }
+}
+
+/**
+ * Build (or incrementally refresh) the index for a project root.
+ *
+ * Reuse rules, in order of cost:
+ * - `size` + `mtimeMs` unchanged → reuse the cached entry, no read at all;
+ * - changed timestamp but identical `sha256` → reuse the cached entry (a
+ *   `git checkout` or a `touch` rewrites mtimes without changing content);
+ * - otherwise re-parse just that file.
+ *
+ * Files touched within `SETTLE_MS` are skipped for this round and keep their
+ * previous entry: the spec's conflict rule, and the difference between a
+ * half-written class and a stale one.
+ *
+ * @param {object} options - build inputs.
+ * @param {string} options.root - project root.
+ * @param {object | null} [options.previous] - the index read from disk.
+ * @param {object | null} [options.previousCache] - the sidecar read from disk.
+ * @param {number} [options.now] - clock override, for tests.
+ * @param {boolean} [options.full] - ignore previous artefacts entirely.
+ * @returns {Promise<{index: object, cache: object, parsed: number, reused: number, skipped: number, files: number}>} the artefacts.
+ */
+export async function buildProjectIndex(options) {
+  const { root } = options
+  const now = options.now ?? Date.now()
+  const previous = options.full === true ? null : (options.previous ?? null)
+  const previousCache = options.full === true ? null : (options.previousCache ?? null)
+
+  const usableCache = previousCache?.version === INDEX_VERSION ? previousCache : null
+  const previousEntries = previous?.content_logic_index ?? {}
+  const cacheEntries = usableCache?.entries ?? {}
+
+  const files = await walkSourceFiles(root)
+  /** @type {Record<string, object>} */
+  const contentLogic = {}
+  /** @type {Map<string, object[]>} */
+  const buckets = new Map()
+  /** @type {Record<string, object>} */
+  const nextEntries = {}
+
+  let parsed = 0
+  let reused = 0
+  let skipped = 0
+  let settling = 0
+
+  for (const rel of files) {
+    const absolute = join(root, ...rel.split('/'))
+    let info
+    try {
+      info = await stat(absolute)
+    } catch {
+      skipped += 1
+      continue
+    }
+    if (!info.isFile()) {
+      skipped += 1
+      continue
+    }
+
+    const cached = cacheEntries[rel]
+    const unchanged = cached !== undefined && cached.size === info.size && cached.mtimeMs === info.mtimeMs
+
+    let summary = ''
+    if (unchanged) {
+      summary = cached.summary ?? ''
+      nextEntries[rel] = cached
+      if (previousEntries[rel] !== undefined) contentLogic[rel] = previousEntries[rel]
+      reused += 1
+    } else if (cached !== undefined && now - info.mtimeMs < SETTLE_MS) {
+      // Mid-write: keep the previous entry rather than parse a torn file.
+      //
+      // Only for files the cache already knows. A file with no cache entry is
+      // new — a fresh checkout, a `git clone`, the first build of a repository
+      // — and refusing those would leave the index empty precisely when it is
+      // most useful. Parsing a half-written *new* file costs one bad entry that
+      // the watcher replaces a debounce later; skipping every new file costs
+      // the whole index.
+      summary = cached.summary ?? ''
+      nextEntries[rel] = cached
+      if (previousEntries[rel] !== undefined) contentLogic[rel] = previousEntries[rel]
+      skipped += 1
+      settling += 1
+    } else {
+      let source
+      try {
+        source = await readFile(absolute, 'utf8')
+      } catch {
+        skipped += 1
+        continue
+      }
+      if (source.includes('\u0000')) {
+        skipped += 1
+        continue
+      }
+      const hash = createHash('sha256').update(source).digest('hex')
+      const hashMatches = cached !== undefined && cached.hash === hash
+      if (hashMatches && previousEntries[rel] !== undefined) {
+        contentLogic[rel] = previousEntries[rel]
+        reused += 1
+      } else if (hashMatches) {
+        reused += 1
+      } else {
+        const entry = extractContentLogic(source, rel)
+        if (entry !== null) contentLogic[rel] = entry
+        parsed += 1
+      }
+      summary = info.size > MAX_FILE_BYTES ? `（超过 ${Math.round(MAX_FILE_BYTES / 1024)} KB，未解析）` : summarizeFile(source, rel)
+      nextEntries[rel] = { size: info.size, mtimeMs: info.mtimeMs, hash, summary }
+    }
+
+    const directory = dirOf(rel)
+    const bucket = buckets.get(directory)
+    const child = { path: rel, type: 'file', language: languageOf(rel), summary }
+    if (bucket === undefined) buckets.set(directory, [child])
+    else bucket.push(child)
+  }
+
+  const directoryIndex = [...buckets.entries()]
+    .sort((left, right) => left[0].localeCompare(right[0]))
+    .map(([path, children]) => ({
+      path,
+      type: 'directory',
+      summary: summarizeDirectory(path, children),
+      children: children.sort((left, right) => left.path.localeCompare(right.path))
+    }))
+
+  const sortedLogic = {}
+  for (const key of Object.keys(contentLogic).sort()) sortedLogic[key] = contentLogic[key]
+
+  const languageTotals = new Map()
+  for (const entry of directoryIndex) {
+    for (const child of entry.children) {
+      languageTotals.set(child.language, (languageTotals.get(child.language) ?? 0) + 1)
+    }
+  }
+  const topLanguages = [...languageTotals.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 5)
+    .map(([language, count]) => `${language} ${count}`)
+    .join('、')
+
+  const projectName = basename(root)
+  const fileCount = directoryIndex.reduce((total, entry) => total + entry.children.length, 0)
+
+  const index = {
+    project_meta: {
+      project_name: projectName,
+      last_updated: new Date(now).toISOString(),
+      file_count: fileCount,
+      global_summary: truncate(
+        `${projectName}：${directoryIndex.length} 个目录、${fileCount} 个文件；语言分布 ${topLanguages}；` +
+          `逻辑条目 ${Object.keys(sortedLogic).length} 个（Java/XML）。索引 v${INDEX_VERSION}，由 dsh-wip-codegen-agent 的后台监听器生成。`,
+        400
+      )
+    },
+    directory_index: directoryIndex,
+    content_logic_index: sortedLogic
+  }
+
+  return {
+    index,
+    cache: { version: INDEX_VERSION, root, updated: new Date(now).toISOString(), entries: nextEntries },
+    parsed,
+    reused,
+    skipped,
+    settling,
+    files: fileCount
+  }
+}
+
+// ---------------------------------------------------------------------------
+// querying
+// ---------------------------------------------------------------------------
+
+/** Score a candidate against the needle; higher is better, 0 means no hit. */
+function score(text, needle) {
+  if (text === undefined || text === null) return 0
+  const haystack = String(text).toLowerCase()
+  if (haystack === needle) return 100
+  const cut = haystack.lastIndexOf('/')
+  const leaf = cut < 0 ? haystack : haystack.slice(cut + 1)
+  if (leaf === needle) return 90
+  if (leaf.startsWith(needle)) return 70
+  if (haystack.includes(needle)) return 40
+  return 0
+}
+
+/**
+ * Search the index by keyword.
+ *
+ * @param {object} index - a built index.
+ * @param {string} query - keyword, matched case-insensitively.
+ * @param {number} [limit] - maximum hits.
+ * @returns {{kind: string, path: string, label: string, detail: string}[]} hits, best first.
+ */
+export function queryIndex(index, query, limit = 20) {
+  const needle = collapse(query).toLowerCase()
+  if (needle === '' || index === null || index === undefined) return []
+
+  /** @type {{score: number, hit: object}[]} */
+  const hits = []
+
+  for (const directory of index.directory_index ?? []) {
+    const directoryScore = score(directory.path, needle)
+    if (directoryScore > 0) {
+      hits.push({
+        score: directoryScore,
+        hit: {
+          kind: 'directory',
+          path: directory.path,
+          label: directory.path,
+          detail: directory.summary ?? ''
+        }
+      })
+    }
+    for (const child of directory.children ?? []) {
+      const fileScore = score(child.path, needle)
+      if (fileScore > 0) {
+        hits.push({
+          score: fileScore,
+          hit: { kind: 'file', path: child.path, label: child.path, detail: child.summary ?? '' }
+        })
+      }
+    }
+  }
+
+  for (const [path, entry] of Object.entries(index.content_logic_index ?? {})) {
+    // How well the file's own classes match. A method or a rule whose class
+    // matches is relevant too: asking for "AttendanceController" should list
+    // what that controller does, not just its own line. Inheriting half the
+    // class score keeps those hits below anything that matched by name.
+    let ownerScore = 0
+    for (const item of entry.classes ?? []) {
+      const itemScore = score(item.name, needle)
+      if (itemScore === 0) continue
+      ownerScore = Math.max(ownerScore, Math.floor(itemScore / 2))
+      hits.push({
+        score: itemScore,
+        hit: {
+          kind: 'class',
+          path,
+          label: `${path} · ${item.name}`,
+          detail: truncate(
+            [
+              item.extends === '' ? '' : `extends ${item.extends}`,
+              (item.implements ?? []).length > 0 ? `implements ${item.implements.join(', ')}` : '',
+              item.summary ?? ''
+            ]
+              .filter((part) => part !== '')
+              .join(' · ')
+          )
+        }
+      })
+    }
+    for (const item of entry.methods ?? []) {
+      const itemScore = Math.max(score(item.name, needle), ownerScore)
+      if (itemScore > 0) {
+        hits.push({
+          score: itemScore,
+          hit: {
+            kind: 'method',
+            path,
+            label: `${path} · ${item.name}(${(item.parameters ?? []).join(', ')})`,
+            detail: truncate(`${item.return_type ?? ''} · ${item.logic_summary ?? ''}`)
+          }
+        })
+      }
+    }
+    for (const item of entry.logic_details ?? []) {
+      const itemScore = Math.max(score(item.rule_name, needle), score(item.description, needle) > 0 ? 30 : 0, ownerScore)
+      if (itemScore > 0) {
+        hits.push({
+          score: itemScore,
+          hit: {
+            kind: 'rule',
+            path,
+            label: `${path} · ${item.rule_name}`,
+            detail: item.description ?? ''
+          }
+        })
+      }
+    }
+  }
+
+  hits.sort((left, right) => right.score - left.score || left.hit.path.localeCompare(right.hit.path))
+  return hits.slice(0, Math.max(1, limit)).map((entry) => entry.hit)
+}
+
+/**
+ * Read one file's structured entry, optionally narrowed to one symbol.
+ *
+ * @param {object} index - a built index.
+ * @param {string} relPath - path relative to the project root, exact or as a suffix.
+ * @param {string} [symbol] - class or method name to narrow to.
+ * @returns {{path: string, directory: string|null, file: object|null, logic: object|null}|null} the entry.
+ */
+export function readIndexEntry(index, relPath, symbol) {
+  if (index === null || index === undefined) return null
+  const wanted = toPosix(relPath)
+  if (wanted === '') return null
+
+  const logic = index.content_logic_index ?? {}
+  const keys = Object.keys(logic)
+  const key =
+    keys.find((candidate) => candidate === wanted) ??
+    keys.find((candidate) => candidate.endsWith(`/${wanted}`)) ??
+    keys.find((candidate) => candidate.endsWith(wanted)) ??
+    null
+
+  const directory = (index.directory_index ?? []).find((entry) =>
+    (entry.children ?? []).some((child) => child.path === (key ?? wanted))
+  )
+  const file = directory?.children.find((child) => child.path === (key ?? wanted)) ?? null
+  let entry = key === null ? null : logic[key]
+
+  const needle = collapse(symbol ?? '').toLowerCase()
+  if (entry !== null && needle !== '') {
+    const classHit = (entry.classes ?? []).some((item) => collapse(item.name).toLowerCase().includes(needle))
+    if (!classHit) {
+      entry = {
+        classes: (entry.classes ?? []).filter((item) => collapse(item.name).toLowerCase().includes(needle)),
+        fields: (entry.fields ?? []).filter((item) => collapse(item.name).toLowerCase().includes(needle)),
+        methods: (entry.methods ?? []).filter((item) => collapse(item.name).toLowerCase().includes(needle)),
+        logic_details: (entry.logic_details ?? []).filter(
+          (item) =>
+            collapse(item.rule_name).toLowerCase().includes(needle) ||
+            collapse(item.description).toLowerCase().includes(needle)
+        )
+      }
+    }
+  }
+
+  return {
+    path: key ?? wanted,
+    directory: directory?.path ?? null,
+    file,
+    logic: entry
+  }
+}
+
+// ---------------------------------------------------------------------------
+// rendering (tool output)
+// ---------------------------------------------------------------------------
+
+/** Format a duration in milliseconds as a short human string. */
+function ageOf(milliseconds) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return '未知'
+  const minutes = Math.floor(milliseconds / 60000)
+  if (minutes < 1) return '不到 1 分钟'
+  if (minutes < 60) return `${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时`
+  return `${Math.floor(hours / 24)} 天`
+}
+
+/**
+ * Render the `status` action.
+ *
+ * @param {object} state - service status.
+ * @returns {string} text for the model.
+ */
+export function formatStatus(state) {
+  const lines = []
+  const meta = state.meta ?? null
+  lines.push(`索引：${state.exists ? '已就绪' : '不存在'}（${state.indexPath}）`)
+  if (meta !== null) {
+    lines.push(
+      `项目：${meta.project_name} · ${meta.file_count} 个文件 · ${(state.directoryCount ?? 0)} 个目录 · ` +
+        `${(state.logicCount ?? 0)} 个逻辑条目`
+    )
+    if (meta.last_updated !== '') {
+      const updated = Date.parse(meta.last_updated)
+      lines.push(
+        `更新时间：${meta.last_updated}（${Number.isNaN(updated) ? '未知' : `${ageOf(state.now - updated)}前`}）`
+      )
+    }
+  }
+  const listener =
+    state.state === 'building'
+      ? '构建中'
+      : state.expiresAt > state.now
+        ? `就绪，租约剩余 ${ageOf(state.expiresAt - state.now)}`
+        : '未启动或租约已过期（下次会话步骤会自动重建）'
+  lines.push(`监听器：${listener}`)
+  if (state.lastError !== null && state.lastError !== undefined) {
+    lines.push(`最近一次构建失败：${state.lastError}`)
+  }
+  lines.push('用法：action=query 按关键词检索；action=read 读单个文件的结构（可加 symbol 收窄）。')
+  return lines.join('\n')
+}
+
+/**
+ * Render the `query` action.
+ *
+ * @param {object[]} hits - from `queryIndex`.
+ * @param {string} query - the keyword.
+ * @returns {string} text for the model.
+ */
+export function formatQuery(hits, query) {
+  if (hits.length === 0) {
+    return `索引中没有命中「${query}」的条目。\n` +
+      '可以换更短的关键词，或改用 grep/glob 直接检索；若怀疑索引过期，先 action=status 看一眼。'
+  }
+  const lines = [`索引命中 ${hits.length} 条（关键词「${query}」）：`]
+  for (const hit of hits) {
+    lines.push(`- [${hit.kind}] ${hit.label}`)
+    if (hit.detail !== '') lines.push(`  ${hit.detail}`)
+  }
+  lines.push('需要细节时用 action=read path=<上面的文件路径> 读结构化条目，不必打开源码。')
+  return lines.join('\n')
+}
+
+/**
+ * Render the `read` action.
+ *
+ * @param {object|null} entry - from `readIndexEntry`.
+ * @param {string} relPath - the requested path.
+ * @returns {string} text for the model.
+ */
+export function formatRead(entry, relPath) {
+  if (entry === null || entry === undefined) {
+    return (
+      `索引里没有「${relPath}」。\n` +
+      '先用 action=query 找一个文件路径；索引只收录 Java 与 MyBatis XML 的结构化条目，其它文件看 directory_index 的摘要。'
+    )
+  }
+  if (entry.file === null && entry.logic === null && entry.directory === null) {
+    // Not a logic file and not in directory_index either: either the path is
+    // wrong or the file appeared after the last build.
+    return (
+      `索引里没有「${relPath}」。\n` +
+      '可能路径不对，也可能是上次构建之后新增的文件（监听器会在下一次增量时收录）。' +
+      '先用 action=query 搜关键词确认路径，或直接用 read 打开。'
+    )
+  }
+  const lines = [`文件：${entry.path}`]
+  if (entry.directory !== null) lines.push(`所在目录：${entry.directory}`)
+  if (entry.file !== null) lines.push(`语言：${entry.file.language} · 摘要：${entry.file.summary}`)
+
+  const logic = entry.logic
+  if (logic === null) {
+    lines.push('该文件没有结构化逻辑条目（索引只解析 Java 与 MyBatis XML）。')
+    return lines.join('\n')
+  }
+
+  for (const item of logic.classes ?? []) {
+    const heritage = [
+      item.extends === '' ? '' : `extends ${item.extends}`,
+      (item.implements ?? []).length > 0 ? `implements ${item.implements.join(', ')}` : ''
+    ]
+      .filter((part) => part !== '')
+      .join(' ')
+    const annotations = (item.annotations ?? []).length > 0 ? ` @${item.annotations.join(' @')}` : ''
+    lines.push(`类 ${item.name}${heritage === '' ? '' : ` ${heritage}`}${annotations}`)
+    if (item.summary !== '') lines.push(`  ${item.summary}`)
+  }
+  if ((logic.fields ?? []).length > 0) {
+    lines.push(`字段 ${logic.fields.length} 个：`)
+    for (const item of logic.fields) {
+      lines.push(`- ${item.name}: ${item.type}${item.comment === '' ? '' : ` — ${item.comment}`}`)
+    }
+  }
+  if ((logic.methods ?? []).length > 0) {
+    lines.push(`方法 ${logic.methods.length} 个：`)
+    for (const item of logic.methods) {
+      lines.push(`- ${item.name}(${(item.parameters ?? []).join(', ')}) → ${item.return_type}`)
+      if (item.logic_summary !== '') lines.push(`  ${item.logic_summary}`)
+      if ((item.key_dependencies ?? []).length > 0) {
+        lines.push(`  依赖：${item.key_dependencies.join('、')}`)
+      }
+    }
+  }
+  if ((logic.logic_details ?? []).length > 0) {
+    lines.push(`业务规则 ${logic.logic_details.length} 条：`)
+    for (const item of logic.logic_details) lines.push(`- ${item.rule_name}：${item.description}`)
+  }
+  return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// the background listener
+// ---------------------------------------------------------------------------
+
+/** Read and parse a JSON artefact, or return null. */
+async function readJson(path) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/** Write a file atomically: a reader never sees a half-written index. */
+async function writeJsonAtomic(path, value) {
+  const temporary = `${path}.tmp`
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+  await rename(temporary, path)
+}
+
+/**
+ * The listener: owns the index lifecycle for one project root.
+ *
+ * States are `idle` and `building`. `ensure()` is the lease check the spec asks
+ * for — it starts a build only when the lease has expired, and never awaits it,
+ * so a session step is never delayed by indexing.
+ *
+ * @param {object} options - service inputs.
+ * @param {string} options.root - project root.
+ * @param {(message: string) => void} [options.warn] - diagnostic sink.
+ * @param {(message: string) => void} [options.log] - info sink.
+ * @param {() => number} [options.now] - clock override, for tests.
+ * @returns {object} the service.
+ */
+export function createProjectIndexService(options) {
+  const { root } = options
+  const warn = options.warn ?? (() => {})
+  const log = options.log ?? (() => {})
+  const now = options.now ?? (() => Date.now())
+  const paths = indexPaths(root)
+
+  let state = 'idle'
+  let expiresAt = 0
+  let lastBuildAt = 0
+  /** @type {string | null} */
+  let lastError = null
+  /** @type {Promise<unknown> | null} */
+  let building = null
+  /** @type {object | null} */
+  let cachedIndex = null
+  let started = false
+  let disposed = false
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let debounceTimer = null
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let followUpTimer = null
+  /** @type {ReturnType<typeof setInterval> | null} */
+  let intervalTimer = null
+  /** @type {{close: () => void} | null} */
+  let watcher = null
+  let watcherActive = false
+
+  async function loadIndex() {
+    if (cachedIndex !== null) return cachedIndex
+    cachedIndex = await readJson(paths.index)
+    return cachedIndex
+  }
+
+  /** Full or incremental rebuild; concurrent callers share one build. */
+  function rebuild(reason, full = false) {
+    if (disposed) return Promise.resolve(null)
+    if (building !== null) return building
+    state = 'building'
+    building = (async () => {
+      const startedAt = now()
+      try {
+        const previous = await loadIndex()
+        const previousCache = await readJson(paths.cache)
+        const result = await buildProjectIndex({
+          root,
+          previous: full ? null : previous,
+          previousCache: full ? null : previousCache,
+          now: startedAt,
+          full
+        })
+        mkdirSync(paths.dir, { recursive: true })
+        await writeJsonAtomic(paths.index, result.index)
+        await writeJsonAtomic(paths.cache, result.cache)
+        cachedIndex = result.index
+        lastBuildAt = now()
+        expiresAt = lastBuildAt + LEASE_MS
+        lastError = null
+        log(
+          `project-index: ${reason} 构建完成 · ${result.files} 个文件（重解析 ${result.parsed}，复用 ${result.reused}，跳过 ${result.skipped}）`
+        )
+        // A file that changed within SETTLE_MS of this build was skipped as
+        // mid-write, and no further watch event is coming for it — the burst
+        // already happened. Without a follow-up the index would stay stale for
+        // a whole lease, so re-check once the file has settled.
+        if (result.settling > 0) scheduleFollowUp()
+        return result
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error)
+        warn(`project-index: ${reason} 构建失败（${lastError}）`)
+        return null
+      } finally {
+        state = 'idle'
+        building = null
+      }
+    })()
+    return building
+  }
+
+  /** Start a build only when the lease has expired. Never awaited by callers. */
+  function ensure(reason) {
+    if (disposed) return
+    if (state === 'building') return
+    if (expiresAt > now()) return
+    void rebuild(reason)
+  }
+
+  /** Watch the tree; a burst of events collapses into one debounced refresh. */
+  function startWatcher() {
+    if (watcher !== null || disposed) return
+    try {
+      watcher = watch(root, { recursive: true, persistent: false }, (_event, filename) => {
+        if (disposed) return
+        if (typeof filename === 'string' && filename !== '' && shouldIgnorePath(filename)) return
+        schedule()
+      })
+      watcher.on?.('error', (error) => {
+        watcherActive = false
+        warn(`project-index: 目录监视中断（${error?.message ?? error}），改为每 30 分钟检查一次`)
+      })
+      watcherActive = true
+    } catch (error) {
+      watcherActive = false
+      warn(`project-index: 无法监视项目目录（${error?.message ?? error}），改为每 30 分钟检查一次`)
+    }
+  }
+
+  function schedule() {
+    if (debounceTimer !== null) clearTimeout(debounceTimer)
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null
+      void rebuild('文件变化')
+    }, DEBOUNCE_MS)
+    debounceTimer.unref?.()
+  }
+
+  /**
+   * One re-check after files that were still settling.
+   *
+   * Deliberately calls `rebuild` rather than `ensure`: the lease was just
+   * renewed by the build that reported the settling files, so `ensure` would
+   * decline. The delay is the settle window plus a margin, which is enough for
+   * an editor's write to finish. It cannot loop — a file skipped twice is
+   * older than `SETTLE_MS` by the second pass.
+   */
+  function scheduleFollowUp() {
+    if (followUpTimer !== null) return
+    followUpTimer = setTimeout(() => {
+      followUpTimer = null
+      void rebuild('补建')
+    }, SETTLE_MS + DEBOUNCE_MS)
+    followUpTimer.unref?.()
+  }
+
+  /** Idempotent: called on every step, does work once. */
+  function start() {
+    if (started || disposed) return
+    started = true
+    startWatcher()
+    intervalTimer = setInterval(() => ensure('租约到期'), LEASE_MS)
+    intervalTimer.unref?.()
+  }
+
+  async function status() {
+    const index = await loadIndex()
+    const meta = index?.project_meta ?? null
+    return {
+      root,
+      indexPath: paths.index,
+      exists: index !== null,
+      state,
+      now: now(),
+      expiresAt,
+      lastBuildAt,
+      lastError,
+      meta,
+      directoryCount: index?.directory_index?.length ?? 0,
+      logicCount: Object.keys(index?.content_logic_index ?? {}).length,
+      watcherActive
+    }
+  }
+
+  function dispose() {
+    disposed = true
+    if (debounceTimer !== null) clearTimeout(debounceTimer)
+    if (intervalTimer !== null) clearInterval(intervalTimer)
+    if (followUpTimer !== null) clearTimeout(followUpTimer)
+    debounceTimer = null
+    intervalTimer = null
+    followUpTimer = null
+    try {
+      watcher?.close()
+    } catch {
+      /* already closed */
+    }
+    watcher = null
+  }
+
+  return {
+    root,
+    paths,
+    start,
+    ensure,
+    rebuild,
+    status,
+    loadIndex,
+    dispose,
+    get leaseExpiresAt() {
+      return expiresAt
+    },
+    get state() {
+      return state
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// the tool
+// ---------------------------------------------------------------------------
+
+/** Tool description shown to the model. */
+const TOOL_DESCRIPTION =
+  '读取当前项目的复合索引（.dsh/index/project_index.json），在不动源码的前提下看清项目结构与业务逻辑。' +
+  '索引由后台监听器维护，每 30 分钟或检测到文件变化时增量更新。' +
+  '先查这里，再决定要不要读源码：除非用户明确要求改源码，否则不要为了回答问题去全量读取源码文件。' +
+  'action=status 先看索引是否就绪；action=query 按关键词（文件路径/类名/方法名/业务规则）检索；' +
+  'action=read 读某个文件的结构化条目（类、字段、方法、业务规则），可用 symbol 收窄到单个类或方法；' +
+  'action=build 强制全量重建（通常不必手动调用）。' +
+  '本工具不会等待构建完成：索引缺失或过期时它直接说明现状，此时改用 grep/glob/read 回答当前问题，' +
+  '并告诉用户「已触发后台索引构建，当前我先基于原生检索为您解答」。'
+
+/** Parameter schema. */
+const TOOL_PARAMETERS = {
+  type: 'object',
+  properties: {
+    action: {
+      type: 'string',
+      enum: ['status', 'query', 'read', 'build'],
+      description: 'status 看索引状态；query 按关键词检索；read 读单个文件的结构；build 强制全量重建。'
+    },
+    query: {
+      type: 'string',
+      description: 'action=query 时的关键词，大小写不敏感。'
+    },
+    path: {
+      type: 'string',
+      description: 'action=read 时的文件路径，相对项目根，可只写路径后缀。'
+    },
+    symbol: {
+      type: 'string',
+      description: 'action=read 时可选，类名或方法名，用于把结果收窄到一个符号。'
+    },
+    limit: {
+      type: 'integer',
+      description: 'action=query 时最多返回多少条，默认 20，上限 50。'
+    }
+  },
+  required: ['action'],
+  additionalProperties: false
+}
+
+/** Output schema: one text block, because every action is prose for the model. */
+const TOOL_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    text: { type: 'string', description: '渲染好的纯文本结果。' }
+  },
+  required: ['text'],
+  additionalProperties: false
+}
+
+/**
+ * Build the `project_index` tool definition.
+ *
+ * @param {object} options - wiring.
+ * @param {(exec: object) => Promise<{root: string, service: object}>} options.resolve - per-Agent service lookup.
+ * @param {(message: string) => void} [options.warn] - diagnostic sink.
+ * @returns {object} a `ToolDefinition`.
+ */
+export function createProjectIndexTool(options) {
+  const { resolve } = options
+  const warn = options.warn ?? (() => {})
+
+  return {
+    name: 'project_index',
+    description: TOOL_DESCRIPTION,
+    parameters: TOOL_PARAMETERS,
+    timeoutMs: 120000,
+    output: {
+      schema: TOOL_OUTPUT_SCHEMA,
+      render(_args, value) {
+        const text = typeof value?.text === 'string' ? value.text : String(value ?? '')
+        return [{ type: 'text', text }]
+      }
+    },
+    async execute(args, exec) {
+      const action = typeof args?.action === 'string' ? args.action : 'status'
+      const { root, service } = await resolve(exec)
+      const limit = Math.min(50, Math.max(1, Number.isInteger(args?.limit) ? args.limit : 20))
+
+      if (action === 'build') {
+        const result = await service.rebuild('手动', true)
+        if (result === null) {
+          return {
+            text: `全量重建失败：${(await service.status()).lastError ?? '未知原因'}。先用 grep/glob 继续当前问题。`
+          }
+        }
+        const state = await service.status()
+        return {
+          text:
+            `已全量重建索引：${result.files} 个文件（重解析 ${result.parsed}，复用 ${result.reused}，跳过 ${result.skipped}）。\n` +
+            `路径：${state.indexPath}`
+        }
+      }
+
+      if (action === 'query') {
+        const index = await service.loadIndex()
+        if (index === null) {
+          service.ensure('工具查询')
+          return {
+            text:
+              '索引尚未生成，已在后台开始构建（不阻塞本次回答）。' +
+              '现在请直接用 grep/glob/read 解决当前问题，并告知用户「已触发后台索引构建，当前我先基于原生检索为您解答」。'
+          }
+        }
+        return { text: formatQuery(queryIndex(index, args?.query ?? '', limit), String(args?.query ?? '')) }
+      }
+
+      if (action === 'read') {
+        const index = await service.loadIndex()
+        const relPath = typeof args?.path === 'string' ? args.path : ''
+        if (index === null) {
+          service.ensure('工具读取')
+          return {
+            text:
+              '索引尚未生成，已在后台开始构建（不阻塞本次回答）。' +
+              '现在请直接用 read 打开该文件，并告知用户「已触发后台索引构建，当前我先基于原生检索为您解答」。'
+          }
+        }
+        return { text: formatRead(readIndexEntry(index, relPath, args?.symbol), relPath) }
+      }
+
+      if (action !== 'status') {
+        warn(`project-index: 未知 action「${action}」`)
+      }
+      service.ensure('工具状态')
+      return { text: formatStatus(await service.status()) }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// plugin
+// ---------------------------------------------------------------------------
+
+/**
+ * Mount the index listener and its tool.
+ *
+ * Nothing here runs a model and nothing posts into the conversation. The only
+ * agent-facing surface is the `project_index` tool; the listener is driven by
+ * `agent/pre-step` (the first step of a session starts it) and by the file
+ * watcher.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx - owning plugin context.
+ * @returns {void}
+ */
+export function apply(ctx) {
+  const warn = (message) => ctx.logger?.warn?.(message)
+  const log = (message) => ctx.logger?.info?.(message)
+
+  /** @type {Map<string, ReturnType<typeof createProjectIndexService>>} */
+  const services = new Map()
+  let disposed = false
+  /** @type {(() => void) | null} */
+  let unregister = null
+
+  function optional(name) {
+    try {
+      return ctx.get?.(name, false) ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /** Project root for one Agent: its working directory, resolved to the repo root. */
+  async function resolveRoot(agent, signal) {
+    const workingDirectory = optional('workingDirectory')
+    if (workingDirectory !== null && agent !== undefined && agent !== null) {
+      try {
+        const directory = await workingDirectory.ensure(agent, signal)
+        if (typeof directory === 'string' && directory !== '') return findProjectRoot(directory)
+      } catch (error) {
+        warn(`project-index: 取工作目录失败（${error?.message ?? error}），改用进程目录`)
+      }
+    }
+    return findProjectRoot(process.cwd())
+  }
+
+  function serviceFor(root) {
+    let service = services.get(root)
+    if (service === undefined) {
+      service = createProjectIndexService({ root, warn, log })
+      services.set(root, service)
+      if (!disposed) service.start()
+    }
+    return service
+  }
+
+  async function resolveService(exec) {
+    const root = await resolveRoot(exec?.agent, exec?.signal)
+    return { root, service: serviceFor(root) }
+  }
+
+  function tryRegister() {
+    if (disposed || unregister !== null) return
+    // `tools` is a declared dependency, so it is on the context here.
+    const tools = optional('tools')
+    if (tools === null || typeof tools.register !== 'function') {
+      warn('project-index: 宿主未提供 tools 服务，project_index 工具未注册')
+      return
+    }
+    try {
+      unregister = tools.register(createProjectIndexTool({ resolve: resolveService, warn }))
+      log('project-index: 已注册 project_index 工具')
+    } catch (error) {
+      warn(`project-index: 注册 project_index 工具失败（${error?.message ?? error}）`)
+    }
+  }
+
+  tryRegister()
+
+  // The spec's "首次接收用户提问后后台静默启动". `next()` is returned
+  // synchronously so a step is never delayed by indexing.
+  ctx.on('agent/pre-step', (payload, next) => {
+    if (!disposed) {
+      if (unregister === null) tryRegister()
+      const agent = payload?.agent
+      if (agent !== undefined && agent !== null) {
+        void (async () => {
+          try {
+            const root = await resolveRoot(agent, payload?.signal)
+            const service = serviceFor(root)
+            service.ensure('会话步骤')
+          } catch (error) {
+            warn(`project-index: 启动监听器失败（${error?.message ?? error}）`)
+          }
+        })()
+      }
+    }
+    return next()
+  })
+
+  ctx.effect(() => () => {
+    disposed = true
+    const release = unregister
+    unregister = null
+    if (typeof release === 'function') {
+      try {
+        release()
+      } catch {
+        /* already gone */
+      }
+    }
+    for (const service of services.values()) service.dispose()
+    services.clear()
+  })
+}

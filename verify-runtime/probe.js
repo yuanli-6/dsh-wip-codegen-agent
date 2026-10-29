@@ -93,6 +93,38 @@ async function observe(ctx) {
     observation.document = { error: String(error?.message ?? error) }
   }
 
+  // The tool surface this preset exposes. `project_index` registers itself at
+  // activation, so a row that reaches ACTIVE can still have failed to register —
+  // the composition would look perfect and the model would never see the tool.
+  try {
+    const tools = ctx.get('tools')
+    if (tools === undefined) {
+      observation.tools = { error: 'ctx.tools is not available in this profile' }
+    } else {
+      const scopeLease = await ctx.agentPresets.acquireScope(observation.presetId)
+      try {
+        // `tools.schemas(scope?)` takes a ScopeKey directly, not a `{ scope }`
+        // wrapper the way `skills.snapshot()` does. Passing the wrapper matches
+        // nothing and returns only global tools — which reads exactly like
+        // "the preset registered no tool at all".
+        const schemas = await tools.schemas(scopeLease.key)
+        const names = schemas.map((schema) => schema.name)
+        const projectIndex = schemas.find((schema) => schema.name === 'project_index')
+        observation.tools = {
+          names,
+          hasProjectIndex: projectIndex !== undefined,
+          projectIndexDescriptionLength:
+            typeof projectIndex?.description === 'string' ? projectIndex.description.length : null,
+          projectIndexActions: projectIndex?.parameters?.properties?.action?.enum ?? null
+        }
+      } finally {
+        await scopeLease?.[Symbol.asyncDispose]?.()
+      }
+    }
+  } catch (error) {
+    observation.tools = { error: String(error?.message ?? error) }
+  }
+
   const skills = ctx.get('skills')
   if (skills === undefined) {
     observation.skills = { error: 'ctx.skills is not available in this profile' }

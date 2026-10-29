@@ -88,6 +88,7 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 |---|---|
 | `dsh-wip-codegen-agent/persona-hot` | 承载规范正文（`complete: true`）；正文是函数，每步重读文件，改完弹框确认即生效 |
 | `@deepseek-ai/dsh-agent-instructions` | 把 `AGENTS.md` 读成一条 user 消息（`maxBytes: 65536`）；**没有它，仓库里的 `AGENTS.md` 根本不生效** |
+| `dsh-wip-codegen-agent/project-index` | 复合索引引擎 + 30 分钟后台监听器 + `project_index` 工具；**没有它，§十七 的索引优先工作流无从执行** |
 | `@deepseek-ai/dsh-tool-skill` | 渲染技能目录 + 提供 `skill` 加载工具；**没有它，内置的 api-test 技能永远加载不了** |
 | `dsh-api-test-bundle` | 接口测试技能本体（可选，装不到就自动不挂） |
 | `delegation` 组（6 行） | `subagent` / `subagent_fork` / `workflow` + 三个控制行；一次调用扇出多个子上下文，**只回结论、不回原文** |
@@ -130,6 +131,68 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 > 根因是文件原文进了主线上下文就不再释放，子代理把这件事挪出主线。`plan-mode` 经实测**没挂**：
 > 它不拦截任何工具，而 `complete: true` 会丢弃它的提示词段，挂上去等于没有。
 
+> **v2.5.0 加了复合索引**：新增 `project-index.js`（引擎 + 30 分钟租约监听器 + `project_index` 工具）
+> 与 §十七。主会话先查索引、只按需读源码，取代 v2.4.0「大范围查阅先派子代理」作为默认路径 ——
+> 派子代理仍然是索引回答不了时的手段，但它不再是第一反应。
+
+### 复合索引：先查索引，再决定读不读源码（v2.5.0 起）
+
+规范 §十七 要求：回答项目结构 / 业务逻辑类问题前，**先查索引**；命中且新鲜时用
+`directory_index` 定位文件、用 `methods` / `logic_details` 拿逻辑，**除非用户明确要求改源码，
+否则不全量读源码**。这条规则要落地，缺的从来不是提示词，而是那份索引本身 —— 没人维护的索引
+一天就过期，过期索引比没有索引更坏（它会自信地给出错答案）。
+
+落盘位置由规范钉死，就在**项目根目录**下（不是插件安装目录）：
+
+```
+<项目根>/.dsh/index/project_index.json   # 三块：project_meta / directory_index / content_logic_index
+<项目根>/.dsh/index/file-cache.json      # 旁挂：每个文件的 size + mtime + sha256
+```
+
+`project_index.json` 严格只有规范要求的三块。哈希与摘要缓存放在 `file-cache.json`，一是保持主文件
+diff 友好（它随 git 提交、随代码评审看），二是缓存是记账不是项目知识。两者都**不会被重装插件覆盖**。
+
+**为什么不是真子代理**。规范原文说「后台监听器子代理」，本实现是 Host 插件里的后台任务
+（`setInterval` + `fs.watch`），没有拉起模型。理由：
+
+- 子代理继承本预设，一次拉起就是一份 40 KB 规范进上下文，按 30 分钟一次算是纯浪费；
+- `delivery: 'parent'` 会把子代理的结果作为消息投进主会话，**必然**打断「静默」这个前提；
+- 子代理同样会继承 `project-index` 行，于是会递归拉起监听器，得再加闸门；
+- 模型驱动的解析结果不确定 —— 索引这种要长期被信任的东西，不该每次都长得不一样。
+
+所以「监听器」的职责边界（全量构建 / 增量更新 / 冲突跳过）一条没少，只是执行者是确定性 JS。
+
+**监听器做什么**：
+
+| 时机 | 动作 |
+|---|---|
+| 主会话第一次 step（`agent/pre-step`） | 后台静默启动，**不阻塞该 step**；索引缺失就全量建，存在且租约未过期就什么都不做 |
+| 每次 step | 检查租约。过期（30 分钟）才重建，未过期直接返回 |
+| 文件变化（`fs.watch`，递归 + 1.2 s 防抖） | 增量：只重解析 size/mtime/sha256 有变化的文件 |
+| 构建时撞上正在写的文件 | 该文件跳过，保留旧条目，并在 2.7 s 后自动补建一次 |
+
+最后一行是实测出来的坑：防抖窗口里的写入会落在「刚改完、还在写」的判定内被跳过，
+而那一批 watch 事件已经用完了 —— 没有补建的话索引会一直旧到租约到期。
+
+**主会话怎么用**：`project_index` 工具四个动作 —— `status`（索引在不在、新不新）、
+`query`（按路径/类名/方法名/业务规则检索）、`read`（读某文件的结构化条目，`symbol` 可收窄到
+单个类或方法）、`build`（强制全量，通常不必手动调）。工具**不等待构建**：索引缺失时它直接说明
+现状，主会话改用 `grep`/`glob`/`read` 回答当前问题，同时告诉用户「已触发后台索引构建，
+当前我先基于原生检索为您解答」。
+
+**解析到什么程度**（Java / XML 走结构解析，其余语言取首段注释）：
+
+- `classes`：类名、`extends`、`implements`、类注解、Javadoc 摘要；
+- `fields`：字段名、类型、上方注释；
+- `methods`：方法名、`"类型 参数名"` 参数表、返回类型、逻辑摘要、关键依赖；
+- `logic_details`：方法体里的 `if (条件) → 动作` 逐条成规则；MyBatis XML 则一条语句一条规则。
+
+摘要优先取 Javadoc，没有才退回声明/首条语句；`// ===== 横幅 =====` 这类装饰性注释会被剥掉
+（保留文字、丢掉等号），因为本仓库到处都是它。
+
+**成本**：全量建一次 `wip-srv`（1698 文件 / 1517 个 Java）约 24 秒，纯 CPU、零 token；
+之后靠增量，改一个文件只重解析一个文件。监听器全程 `unref()`，进程不会因它不退出。
+
 ### `AGENTS.md` 怎么生效（v2.4.0 起）
 
 `agent-instructions` 把说明文件读成一条 **user 消息**（`<system-reminder>` 包裹），不是提示词段落。
@@ -156,6 +219,9 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 
 代价要说清楚：每个子代理都是一次独立的模型调用，扇出 N 个就是 N 份 token。
 它省的是主线上下文的**持续占用**，不是总开销。
+
+v2.5.0 起先查索引：上面那几个典型场景**多数能直接用 `project_index` 的 `query` 回答**，
+不必派子代理。索引回答不了的（需要读具体实现细节、需要跨文件比对代码风格）才派子代理。
 
 ### 三个必需的配置字段（别删）
 
@@ -256,7 +322,9 @@ node check-encoding.mjs    # 全仓库无 BOM、JSON 可解析、脚本语法通
 都是**可移植的**：只读本包内相对路径，不依赖任何机器专属路径。
 
 - `verify.mjs` 拿 `buildDefinition()` 的实际输出与磁盘上的正文**逐字比对**，确认没有 fallback
-  正文混进来、正文没被截断；并断言两个**必填配置**在场；
+  正文混进来、正文没被截断；并断言两个**必填配置**在场；还直接驱动索引引擎
+  （`parseJavaSource` / `parseXmlMapper` / `queryIndex` / `readIndexEntry`）断言解析与检索结果，
+  所以引擎改坏了离线就能发现，不必真装一次；
 - `verify-lifecycle.mjs` 用假 context 驱动 `apply()`，**证明卸载真的会 dispose**；
 - `check-patch.mjs` 优先借用 DSH 安装里的真实 js-yaml，找不到时退化到内置最小解析器。
 
@@ -333,6 +401,7 @@ dsh-wip-codegen-agent/
 ├── cordis.patch.yml                    # insert 一行插件条目（热插拔的开关）
 ├── index.js                            # 预设定义：buildDefinition() + apply()
 ├── persona-hot.js                      # persona 行：正文每步重读文件，改完即生效
+├── project-index.js                    # 索引引擎 + 30 分钟监听器 + project_index 工具
 ├── assets/
 │   └── wip-codegen/
 │       └── system-prompt.md            # 规范正文（唯一可编辑的内容源，含 §十五 全局规则）
@@ -365,6 +434,20 @@ persona 那一行挂的是本包自己的 `persona-hot.js`，不是平台自带�
 差别只有一个，但很关键：后者的正文是**配置字符串**，而预设配置在挂载时会被 `structuredClone`，
 于是正文被钉死在激活那一刻；前者的正文是**函数**，提示词注册表每次组装都重新调用，
 所以文件一改、下一步就是新正文（详见「改规范正文」）。
+
+`project-index.js` 那一行同理是**本包自己的模块**，不是平台包：它要做的事平台没有现成的包提供
+（确定性源码解析 + 租约式后台重建 + 一个 `project_index` 工具）。
+
+它的 `inject` 是 `['tools']`，`workingDirectory` 才是可选的（用 `ctx.get(name, false)` 惰性取，
+取不到就退化成 `process.cwd()` 找项目根）。这个分工是踩出来的，两处都别再改回去：
+
+- **`tools` 必须写成硬依赖。** 写成 `ctx.get('tools', false)` 惰性取时，激活那一刻服务常常还没上
+  context，查出来是空的；而唯一的重试挂在 `agent/pre-step` 上——于是「挂载了预设但没跑过任何
+  step」的场合（正是 `verify-runtime` 的 probe 干的事）会出现组合完美、每行都 ACTIVE、模型却
+  拿不到工具。`verify-runtime` 的「`project_index` 工具确实到得了模型」这条断言就是为此加的。
+- **`inject` 只能用数组形式。** 写成 `{ required: [...], optional: [...] }` 时 cordis 把键名当
+  服务名，于是等两个叫 `required` / `optional` 的服务，整行卡在 `PENDING`，报
+  `waiting for required, optional`。这个坑也踩过一次。
 
 ## License
 
