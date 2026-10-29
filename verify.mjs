@@ -52,6 +52,20 @@ const assert = (condition, message) => {
   if (!condition) throw new Error(message)
 }
 
+/**
+ * Every row, group rows expanded into their children.
+ *
+ * A `cordis:group` row is itself a row, but the plugins that actually mount are
+ * in its `config` array. Assertions about "what is mounted" must read this
+ * flattened view; assertions about the definition's own shape read
+ * `definition.plugins` directly.
+ *
+ * @param {object[]} rows - a row list, possibly containing groups.
+ * @returns {object[]} the leaf rows.
+ */
+const flattenRows = (rows) =>
+  rows.flatMap((row) => (row.group === true && Array.isArray(row.config) ? flattenRows(row.config) : [row]))
+
 // ── the spec asset ────────────────────────────────────────────────────────────
 const rawSpec = readFileSync(SPEC_URL, 'utf8')
 
@@ -97,6 +111,15 @@ check('spec carries the mandatory confirmation flow', () => {
 })
 check('spec exposes an append target for global rules', () => {
   assert(rawSpec.includes('## 十五、全局规则（用户追加）'), '§十五 is missing, §14.6 would have nowhere to append')
+})
+check('spec tells the model when to delegate, since the tool rows cannot', () => {
+  // `tool-subagent` and `tool-workflow` register their own prompt sections, and
+  // this preset's persona is `complete: true` — assembly keeps only that one
+  // section, so their guidance never reaches the model. §16.10 is the only
+  // thing that tells it the tools exist and what they cost.
+  for (const needle of ['### 16.10', 'subagent', 'workflow', '正在改的那一个文件必须自己读']) {
+    assert(rawSpec.includes(needle), `§16.10 no longer mentions "${needle}"`)
+  }
 })
 
 // ── the definition handed to agentPresets.register() ──────────────────────────
@@ -148,10 +171,13 @@ check('every row is a well-formed entry', () => {
     assert(typeof row === 'object' && row !== null, 'a row is not an object')
     assert(typeof row.id === 'string' && row.id.length > 0, `row ${JSON.stringify(row)} has no id`)
     assert(typeof row.name === 'string' && row.name.length > 0, `row ${row.id} has no name`)
+    if (row.group === true) {
+      assert(Array.isArray(row.config), `group ${row.id} has no config array — its children would never mount`)
+    }
   }
 })
-check('every row names a first-party package, the companion, or this bundle own persona', () => {
-  for (const row of definition.plugins) {
+check('every row names a first-party package, the companion, a group, or this bundle own persona', () => {
+  for (const row of flattenRows(definition.plugins)) {
     const firstParty = row.name.startsWith('@deepseek-ai/dsh-')
     assert(
       firstParty || row.name === 'dsh-api-test-bundle' || row.name === PERSONA_ROW,
@@ -159,8 +185,8 @@ check('every row names a first-party package, the companion, or this bundle own 
     )
   }
 })
-check('row ids are unique', () => {
-  const ids = definition.plugins.map((row) => row.id)
+check('row ids are unique across groups', () => {
+  const ids = flattenRows(definition.plugins).map((row) => row.id)
   assert(new Set(ids).size === ids.length, `duplicate ids in ${ids.join(', ')}`)
 })
 check('exactly one persona row exists', () => {
@@ -248,7 +274,9 @@ check('no fallback body was served', () => {
 console.log('')
 console.log('tool surface')
 
-const enabledNames = definition.plugins.filter((row) => row.disabled !== true).map((row) => row.name)
+const enabledNames = flattenRows(definition.plugins)
+  .filter((row) => row.disabled !== true)
+  .map((row) => row.name)
 check('a shell row is enabled for this platform', () => {
   const shell = enabledNames.filter((n) => n.includes('tool-pwsh') || n.includes('tool-bash'))
   assert(shell.length === 1, `expected exactly 1 enabled shell row, found ${shell.length}`)
@@ -298,16 +326,22 @@ const gated = buildDefinition((message) => warnings.push(message), { apiTest: fa
 check('with the companion absent the two skill rows are dropped', () => {
   assert(!gated.plugins.some((r) => r.name === 'dsh-api-test-bundle'), 'companion row survived the gate')
   assert(!gated.plugins.some((r) => r.name.includes('dsh-tool-skill')), 'tool-skill row survived the gate')
-  assert(definition.plugins.length - gated.plugins.length === 2, 'the gate should drop exactly two rows')
+  assert(
+    flattenRows(definition.plugins).length - flattenRows(gated.plugins).length === 2,
+    'the gate should drop exactly two rows'
+  )
 })
 check('with the companion absent the Agent still mounts its core rows', () => {
-  const names = gated.plugins.map((r) => r.name)
+  const names = flattenRows(gated.plugins).map((r) => r.name)
   for (const needle of [PERSONA_ROW, 'dsh-tool-fs', 'dsh-tool-fs-search', 'dsh-tool-ask-user', 'dsh-tool-todo']) {
     assert(names.some((n) => n.includes(needle)), `core row ${needle} was dropped too`)
   }
   const shells = names.filter((n) => n.includes('tool-pwsh') || n.includes('tool-bash'))
   assert(shells.length === 1, `expected exactly 1 shell row without the companion, got ${shells.length}`)
-  assert(gated.plugins.length === 6, `expected 6 rows without the companion, got ${gated.plugins.length}`)
+  assert(
+    flattenRows(gated.plugins).length === 13,
+    `expected 13 rows without the companion, got ${flattenRows(gated.plugins).length}`
+  )
 })
 check('with the companion absent a diagnostic is emitted', () => {
   assert(
@@ -327,14 +361,67 @@ check('the persona is identical with and without the companion', () => {
   const specOf = (d) => d.plugins.find((r) => r.name === PERSONA_ROW).config.specCharacters
   assert(specOf(withRows) === specOf(without), 'the spec text changed with the companion gate')
 })
-check('no delegation or workflow rows are mounted', () => {
-  for (const needle of ['dsh-tool-subagent', 'dsh-tool-workflow', 'dsh-tool-ralph']) {
-    assert(!definition.plugins.some((row) => row.name.includes(needle)), `${needle} is mounted`)
+check('the delegation group is mounted and isolates workflowEngine', () => {
+  // `workflow-ptc` publishes `workflowEngine`. A provider mounted without an
+  // `isolate` realm publishes into the ROOT realm, and the preset registry
+  // rejects that mount with "Preset services require isolate realms" — the
+  // whole preset goes broken, not just the row. The group is what carries it.
+  const group = definition.plugins.find((row) => row.group === true && row.id === 'delegation')
+  assert(group !== undefined, 'the delegation group is not mounted')
+  assert(group.disabled !== true, 'the delegation group is disabled')
+  assert(group.isolate?.workflowEngine === true, 'the delegation group does not isolate workflowEngine')
+})
+check('the delegation tools are present, so one turn can fan out file reads', () => {
+  const names = flattenRows(definition.plugins).map((row) => row.name)
+  for (const needle of [
+    'dsh-tool-subagent',
+    'dsh-tool-subagent-control',
+    'dsh-workflow-ptc',
+    'dsh-tool-workflow'
+  ]) {
+    assert(names.some((n) => n.includes(needle)), `missing ${needle}`)
   }
+})
+check('subagents inherit this preset instead of defaulting to another one', () => {
+  // A child on a different preset would not carry the spec, so its summaries
+  // would be written against a different ruleset than the parent's.
+  const rows = flattenRows(definition.plugins).filter((row) => row.name === '@deepseek-ai/dsh-tool-subagent')
+  assert(rows.length === 2, `expected a spawn and a fork row, found ${rows.length}`)
+  for (const row of rows) {
+    assert(!('agentPreset' in (row.config ?? {})), `row ${row.id} pins agentPreset — children would lose the spec`)
+  }
+})
+check('the delegation providers stay in the host plane', () => {
+  // `subagents` / `ptc-runtime` are process singletons the host already owns.
+  // A second copy in the preset would fight the first.
+  for (const needle of ['dsh-subagent-spawn-in-process', 'dsh-ptc-runtime']) {
+    assert(
+      !flattenRows(definition.plugins).some((row) => row.name.includes(needle)),
+      `${needle} is mounted again — the host plane already provides it`
+    )
+  }
+})
+check('plan-mode is NOT mounted', () => {
+  // It registers a prompt section and an `exit_plan_mode` tool and enforces
+  // nothing else. This preset's persona is `complete: true`, so every other
+  // section is dropped at assembly: the guidance would vanish and the row would
+  // be a `/plan` switch that changes no behaviour.
+  assert(
+    !flattenRows(definition.plugins).some((row) => row.name.includes('dsh-plan-mode')),
+    'plan-mode is mounted — its section cannot survive the complete persona'
+  )
+})
+check('agent-instructions is mounted with its required maxBytes', () => {
+  const row = flattenRows(definition.plugins).find((r) => r.name === '@deepseek-ai/dsh-agent-instructions')
+  assert(row !== undefined, 'agent-instructions is missing — AGENTS.md would never reach the model')
+  assert(
+    Number.isInteger(row.config?.maxBytes) && row.config.maxBytes > 0,
+    `maxBytes = ${JSON.stringify(row.config?.maxBytes)} (required, no default)`
+  )
 })
 check('no memory or plugin-manager rows are mounted', () => {
   for (const needle of ['meow-memory', 'plugin-manager']) {
-    assert(!definition.plugins.some((row) => row.name.includes(needle)), `${needle} is mounted`)
+    assert(!flattenRows(definition.plugins).some((row) => row.name.includes(needle)), `${needle} is mounted`)
   }
 })
 
@@ -430,7 +517,7 @@ if (warnings.length > 0) {
   console.log('')
 }
 if (failures.length === 0) {
-  console.log(`ALL CHECKS PASSED (spec ${rawSpec.length} chars, ${definition.plugins.length} plugin rows, spec path ${fileURLToPath(SPEC_URL)})`)
+  console.log(`ALL CHECKS PASSED (spec ${rawSpec.length} chars, ${flattenRows(definition.plugins).length} plugin rows in ${definition.plugins.length} top-level entries, spec path ${fileURLToPath(SPEC_URL)})`)
 } else {
   console.log(`${failures.length} CHECK(S) FAILED:`)
   for (const line of failures) console.log(`  - ${line}`)

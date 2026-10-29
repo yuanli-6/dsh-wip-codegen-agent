@@ -146,9 +146,15 @@ async function observe(ctx) {
     // config. The persona row deliberately carries no prompt text (that is what
     // makes it hot-reloadable), so `config.prefix` no longer exists to read.
     const body = own.specBody()
+    // Groups expand into their children; the top-level count alone would hide
+    // every delegation row behind one `cordis:group` entry.
+    const flat = (rows) =>
+      rows.flatMap((row) => (row.group === true && Array.isArray(row.config) ? flat(row.config) : [row]))
+    const leafRows = flat(definition.plugins)
     observation.bundle = {
       rowCount: definition.plugins.length,
-      rows: definition.plugins.map((row) => row.name),
+      flatRowCount: leafRows.length,
+      rows: leafRows.map((row) => row.name),
       specChars: body.length,
       specHasSqlSection: body.includes('十三、SQL Server 建表脚本生成规范'),
       specHasConfirmation: body.includes('十四、强制交互流程'),

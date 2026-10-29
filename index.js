@@ -90,6 +90,18 @@ const SKILL_TOOL_PACKAGE = '@deepseek-ai/dsh-tool-skill'
 /** Cap for each catalog description; the companion's description is long and this is a one-skill catalog. */
 const CATALOG_DESCRIPTION_MAX_LENGTH = 400
 
+/** Cordis' built-in row type: mounts its own `config` array as a nested group. */
+const GROUP_PACKAGE = 'cordis:group'
+
+/**
+ * Byte cap for the instruction files the `agent-instructions` row reads.
+ *
+ * Required with no fallback, so omitting it fails the activation audit — and a
+ * failed audit rejects the whole preset, not just this row. The value matches
+ * the shipped `standard` preset.
+ */
+const AGENTS_MAX_BYTES = 65536
+
 /**
  * Appended to the spec as its own trailing block.
  *
@@ -213,10 +225,22 @@ function readSpec(warn) {
  * Build the preset definition handed to the registry.
  *
  * The row list is intentionally small. The persona carries the spec; a shell,
- * file access, search, and the two interaction tools do the work. Notably
- * absent, and deliberately so: the delegation/workflow rows (this agent writes
- * code, it does not dispatch) and `plan-mode` (the spec is already a complete
- * procedure).
+ * file access, search, and the two interaction tools do the work.
+ *
+ * Three additions since v2.3.0, each for a concrete cost it removes:
+ *
+ * - `agent-instructions` reads `AGENTS.md` into a *user* message, so it is the
+ *   only way to make repository conventions stick without retyping them per
+ *   session. User messages survive `complete: true`; prompt sections do not.
+ * - `delegation` (subagent + workflow) lets one assistant turn fan out N file
+ *   reads into N child contexts and return only the summaries. Reading them in
+ *   the parent is what makes a multi-file change cost one full re-read per
+ *   file.
+ * - Still absent, deliberately: `plan-mode`. It enforces nothing on its own —
+ *   it registers a prompt section and an `exit_plan_mode` tool, and this
+ *   preset's `complete: true` persona is the only section assembly keeps, so
+ *   the guidance would be dropped and the row would be a `/plan` switch that
+ *   changes no behaviour.
  *
  * The skill rows are the exception to "no skills": the testing companion is
  * part of this Agent's job, so `tool-skill` is mounted to render the catalog
@@ -254,6 +278,16 @@ export function buildDefinition(warn, options = {}) {
         // exists to solve.
         specCharacters: spec.length
       }
+    },
+    {
+      id: 'agent-instructions',
+      name: '@deepseek-ai/dsh-agent-instructions',
+      // `maxBytes` is required with no fallback; see the note on tool-fs-search.
+      // With no other config the row reads `AGENTS.md` from `$DSH_HOME` and
+      // `$DSH_AGENTS_HOME` (global) plus every ancestor of the working
+      // directory up to the `.git` root (project), which is exactly the
+      // global-plus-per-repository split the spec asks for.
+      config: { maxBytes: AGENTS_MAX_BYTES }
     }
   ]
 
@@ -303,6 +337,62 @@ export function buildDefinition(warn, options = {}) {
       config: { allowParallelInProgress: true }
     }
   )
+
+  // The delegation group. One `cordis:group` row, because two of its members
+  // publish services (`workflow-ptc` owns `workflowEngine`) and a provider
+  // without an `isolate` realm publishes into the ROOT realm, where the
+  // registry rejects the mount outright with "Preset services require isolate
+  // realms". `isolate: { workflowEngine: true }` gives them a private realm.
+  //
+  // The providers themselves (`subagents`, `subagent-spawn-in-process`,
+  // `ptc-runtime`) stay in the host plane on purpose: they are process
+  // singletons, and what a preset picks is which delegation *tools* its agent
+  // sees. Mounting them here would be a second copy fighting the first.
+  //
+  // `agentPreset` is left unset so a child inherits this agent's preset; the
+  // spec's conventions must reach the subagent too, or its summaries are
+  // written against a different ruleset. `modelSelectionSettings: true` needs
+  // the host row `@deepseek-ai/dsh-tool-subagent/model-selection-settings`,
+  // which `dsh-web-app` keeps enabled.
+  plugins.push({
+    id: 'delegation',
+    name: GROUP_PACKAGE,
+    group: true,
+    isolate: { workflowEngine: true },
+    config: [
+      {
+        id: 'tool-subagent-control',
+        name: '@deepseek-ai/dsh-tool-subagent-control'
+      },
+      {
+        id: 'tool-subagent-list-agents',
+        name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+      },
+      {
+        id: 'tool-subagent',
+        name: '@deepseek-ai/dsh-tool-subagent',
+        config: {
+          provider: 'spawn',
+          toolName: 'subagent',
+          modelSelectionSettings: true
+        }
+      },
+      {
+        id: 'tool-subagent-fork',
+        name: '@deepseek-ai/dsh-tool-subagent',
+        config: { provider: 'fork', toolName: 'subagent_fork' }
+      },
+      {
+        id: 'workflow-ptc',
+        name: '@deepseek-ai/dsh-workflow-ptc',
+        config: { provider: 'spawn' }
+      },
+      {
+        id: 'tool-workflow',
+        name: '@deepseek-ai/dsh-tool-workflow'
+      }
+    ]
+  })
 
   return {
     id: PRESET_ID,

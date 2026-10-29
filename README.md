@@ -36,7 +36,7 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 预设里引用一个装不上的包会让整条预设激活失败（见「两个真实的坑」），所以插件会先探测
 `dsh-api-test-bundle` 是否可解析，解析不到就只记一条警告、不挂那两行。
 
-锁定版本：`github:yuanli-6/dsh-wip-codegen-agent#v2.3.0`。
+锁定版本：`github:yuanli-6/dsh-wip-codegen-agent#v2.4.0`。
 本地改代码时用目录安装：`action: install_bundle, target: <本目录绝对路径>`。
 
 装完**新开一个对话**，预设选择里就能看到 **WIP/HRP 代码生成**。
@@ -87,8 +87,10 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 | 行 | 为什么给 |
 |---|---|
 | `dsh-wip-codegen-agent/persona-hot` | 承载规范正文（`complete: true`）；正文是函数，每步重读文件，改完弹框确认即生效 |
+| `@deepseek-ai/dsh-agent-instructions` | 把 `AGENTS.md` 读成一条 user 消息（`maxBytes: 65536`）；**没有它，仓库里的 `AGENTS.md` 根本不生效** |
 | `@deepseek-ai/dsh-tool-skill` | 渲染技能目录 + 提供 `skill` 加载工具；**没有它，内置的 api-test 技能永远加载不了** |
 | `dsh-api-test-bundle` | 接口测试技能本体（可选，装不到就自动不挂） |
+| `delegation` 组（6 行） | `subagent` / `subagent_fork` / `workflow` + 三个控制行；一次调用扇出多个子上下文，**只回结论、不回原文** |
 | `tool-fs` / `tool-fs-search` | 读 SQL/样例/基准类、写生成出的代码 |
 | `pwsh`（Windows）/ `bash`（其他） | 跑构建、看目录 |
 | `tool-ask-user` | **§十四 的确认流程全靠它**（没有它就无法"先确认再落地"） |
@@ -96,13 +98,20 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 
 **刻意不给**，都有理由：
 
-- `subagent` / `workflow` / `ralph` —— 这个 Agent 是写代码的，不派活；
+- `ralph` —— 这个 Agent 的循环由 §十 固定，不需要另一套自转；
 - `memory_*` —— 规范与记忆无关；
 - `plugin_manager` —— 不许它改插件；
-- `plan-mode` —— 规范自己就是一套完整流程。
+- `plan-mode` —— 它只注册一段提示词和 `exit_plan_mode` 工具，**不做任何工具拦截**；
+  而本预设的 persona 是 `complete: true`，组装时其余段落全部丢弃，那段引导进不来，
+  挂上去只剩一个 `/plan` 开关，行为一点不变。
 
 > v1.x 曾经刻意不给 `skill`（省 token）。v2.0.0 改了：既然是"把这个插件配置到这个 agent 里"，
 > 就必须有目录与加载工具，否则技能注册了也没人看得见。代价是一条技能描述（上限 400 字符）。
+
+> v1.x～v2.3.0 刻意不给 `subagent` / `workflow`，理由是"这个 Agent 是写代码的，不派活"。
+> v2.4.0 推翻了它：**大型项目多文件变更时，真正的成本是每个文件都要在主线里被完整读一遍**。
+> 子代理把 N 次读盘变成 N 个独立上下文，主线只收摘要；`workflow` 则让一次调用并发扇出。
+> 两者都不改规范，只改"谁去读"。
 
 > **v2.0.1 修的是 v2.0.0 的致命 bug**：正文末尾曾注入 `工作目录：{{cwd}}`，
 > 而平台的提示词循环只注册 `provider` / `model` 两个变量，于是每次模型请求都在
@@ -115,15 +124,48 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 > 正文改完弹框确认即可生效，不用重装（见「改规范正文」）。顺带给 §十五 加了一条强制约束：
 > 全局规则与 §二～§六 冲突时必须先问，不得自行裁决。
 
-### 两个必需的配置字段（别删）
+> **v2.4.0 加了三个必需字段之外的协作能力**：`agent-instructions`（让 `AGENTS.md` 真正生效）、
+> `delegation` 组（`subagent` / `subagent_fork` / `workflow`）、以及 §十六 里一条关于
+> 「大范围查阅先派子代理」的使用规则。起因是「大型项目多文件变更时，每查一个文件都要重复思考」——
+> 根因是文件原文进了主线上下文就不再释放，子代理把这件事挪出主线。`plan-mode` 经实测**没挂**：
+> 它不拦截任何工具，而 `complete: true` 会丢弃它的提示词段，挂上去等于没有。
 
-`tool-fs-search` 的 `sampleOverCapGlobResults` 与 `tool-todo` 的 `allowParallelInProgress`
-在本版 DSH 里是**必填且无默认值**。少一个，激活审计就会否掉整条预设：
+### `AGENTS.md` 怎么生效（v2.4.0 起）
+
+`agent-instructions` 把说明文件读成一条 **user 消息**（`<system-reminder>` 包裹），不是提示词段落。
+这一点很关键：**user 消息不受 `complete: true` 影响**，所以它能和本 Agent 的完整 persona 共存。
+
+读哪些文件（配置里没写就按默认）：
+
+| 范围 | 路径 |
+|---|---|
+| 用户全局 | `$DSH_HOME/AGENTS.md`（即 `C:\Users\GSH\.dsh\AGENTS.md`）与 `$DSH_AGENTS_HOME/AGENTS.md`；两者内容相同时只渲染一次 |
+| 项目 | 从 `findProjectRoot(cwd, [".git"])` 找到的项目根起，沿 `ancestorChain(projectRoot, cwd)` **逐级向下**读每一级的 `AGENTS.md` / `CLAUDE.md` 与 `AGENTS.local.md` / `CLAUDE.local.md` |
+
+⚠️ **项目根由 `.git` 决定，向上查找到项目根就停。** 如果 `wip-srv` 自己是一个 git 仓库，
+那么放在上一级 `C:\dDir\java-project\AGENTS.md` 的内容**永远不会被读到**——这种情况要用全局那份，
+或者放进各仓库自己的 `AGENTS.md`。
+
+文件改动会被重新读取（按内容摘要比对），不需要重启。
+
+### 什么时候该派子代理
+
+规范 §十六 里那条规则的要点：**需要看 3 个以上文件、且只要结论不要原文时，派子代理或 `workflow`。**
+典型场景是"找出所有调用 X 的地方""这个字段在哪些表里出现过""这几份 Mapper XML 的排序口径一致吗"。
+反过来，**正在写的那一个文件必须自己读**——子代理返回的摘要不足以支撑逐行修改。
+
+代价要说清楚：每个子代理都是一次独立的模型调用，扇出 N 个就是 N 份 token。
+它省的是主线上下文的**持续占用**，不是总开销。
+
+### 三个必需的配置字段（别删）
+
+`tool-fs-search` 的 `sampleOverCapGlobResults`、`tool-todo` 的 `allowParallelInProgress`、
+`agent-instructions` 的 `maxBytes` 在本版 DSH 里是**必填且无默认值**。少一个，激活审计就会否掉整条预设：
 
 > 现象是预设变成 `broken`、**选都选不了**，而报错只出现在预设的 `broken` 字段里。
 
-v1.x 正是漏了这两个字段，所以那个版本**从来没有真正可用过**（离线自检全绿，因为离线看不到配置契约）。
-现在 `index.js` 里两行都带上（值取自平台自带的 `standard` 预设），`verify.mjs` 也会断言它们，
+v1.x 正是漏了前两个字段，所以那个版本**从来没有真正可用过**（离线自检全绿，因为离线看不到配置契约）。
+现在 `index.js` 里三行都带上（值取自平台自带的 `standard` 预设），`verify.mjs` 也会断言它们，
 `verify-runtime/run.mjs` 则在真实安装上验证预设不 broken。
 
 ---

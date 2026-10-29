@@ -252,6 +252,23 @@ if (start === -1 || end === -1) {
       assert(composition.rows.some((row) => row.moduleName.includes(needle)), `${needle} row missing`)
     }
   })
+  check('agent-instructions is mounted, so AGENTS.md reaches the model', () => {
+    assert(
+      composition.rows.some((row) => row.moduleName.includes('dsh-agent-instructions') && row.enabled !== false),
+      `no agent-instructions row (rows: ${composition.rows.map((row) => row.moduleName).join(', ')})`
+    )
+  })
+  check('the delegation tools are mounted', () => {
+    for (const needle of ['dsh-tool-subagent', 'dsh-workflow-ptc', 'dsh-tool-workflow']) {
+      assert(
+        composition.rows.some((row) => row.moduleName.includes(needle) && row.enabled !== false),
+        `${needle} row missing`
+      )
+    }
+  })
+  check('plan-mode is not mounted', () => {
+    assert(!composition.rows.some((row) => row.moduleName.includes('dsh-plan-mode')), 'plan-mode row is mounted')
+  })
   check('the declared document lists the companion row', () => {
     assert(typeof observation.document?.content === 'string', 'readDocument returned nothing')
     assert(observation.document.content.includes(COMPANION_PACKAGE), 'the companion row is not in the declared composition')
@@ -334,7 +351,8 @@ if (start === -1 || end === -1) {
   console.log('spec text carried by the persona')
   check('the installed bundle reports its own definition', () => {
     assert(!observation.bundle?.error, String(observation.bundle?.error))
-    assert(observation.bundle.rowCount === 8, `rowCount = ${String(observation.bundle?.rowCount)}`)
+    assert(observation.bundle.rowCount === 10, `rowCount = ${String(observation.bundle?.rowCount)}`)
+    assert(observation.bundle.flatRowCount === 15, `flatRowCount = ${String(observation.bundle?.flatRowCount)}`)
   })
   check('the spec carries the SQL, confirmation and global-rule sections', () => {
     assert(observation.bundle.specHasSqlSection, 'SQL section missing')
