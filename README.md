@@ -139,6 +139,21 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 > **v2.5.1**：`action=read` 的输出里直接带上该文件的 `sha256`。原来「要结构」和「要凭证」是两次
 > 调用（先 `read` 再 `verify`），现在一次就够 —— 少一次往返，也少一个「忘了 verify 就直接信」的机会。
 
+> **v2.6.0 把索引从「骨架」补成「可定位」**（`INDEX_VERSION` 1 → 2，旧 `file-cache.json` 自动作废）：
+>
+> - **行号**：类、字段、方法、常量、枚举值、构造器、业务规则全部带 1-based 行号。`query` 与 `read`
+>   的每条输出都能直接落到源码某一行，不必再 grep 找位置。实测 3386 条 Java 规则 + 251 条 XML
+>   语句逐条比对源码，`bad=0`。
+> - **常量 / 枚举值 / 构造器**：`public interface` 的隐式常量（`String KEY = "..."`）、`enum` 的枚举项
+>   与参数、构造器签名都进索引。改造前这三类**完全不被收录** —— `WipConstant.java` 是 0 字段，
+>   `BusinessType.java` 是 0 字段，而它们恰恰是字典口径的唯一来源。
+> - **注解参数值**：`@RequestMapping("/taskArrangement")`、`@PostMapping("/getByPage")`、
+>   `@Operation(summary = "…")`、`@TableId/@TableField(value = "…")`、`@Schema(description = "…")`
+>   的参数不再被丢弃。改造前索引只知道「有个 RequestMapping」，不知道它服务哪个 URL。
+> - **跨文件关系**：`import`（12070 条）、`relations`（4882 条，72% 解析出本项目路径）、
+>   Mapper 接口 ↔ XML 双向互指（`mapper_interface` / `mapper_xml`）。
+> - **字段中文说明**回退到 `@Schema(description)`：全库空注释 58.5% → 25%，实体与 Req 52.8% → 7%。
+
 ### 复合索引：先查索引，再决定读不读源码（v2.5.0 起）
 
 规范 §十七 要求：回答项目结构 / 业务逻辑类问题前，**先查索引**；命中且**文件 hash 未变**时用
@@ -205,12 +220,27 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 
 **解析到什么程度**（Java / XML 走结构解析，其余语言取首段注释）：
 
-- `classes`：类名、`extends`、`implements`、类注解、Javadoc 摘要；
-- `fields`：字段名、类型、上方注释；
-- `methods`：方法名、`"类型 参数名"` 参数表、返回类型、逻辑摘要、关键依赖；
-- `logic_details`：方法体里的 `if (条件) → 动作` 逐条成规则；MyBatis XML 则一条语句一条规则。
+| 键 | 内容 |
+|---|---|
+| `package` / `imports` | 包名；`import` 全限定名（上限 80 条，`import static` 与 `*` 通配都收） |
+| `classes` | `name`、`kind`（class/interface/enum/record/mapper）、`extends`、`implements`、`annotations` + `annotation_args`、`line`、Javadoc 摘要；interface 带 `constants`，enum 带 `enum_values` |
+| `fields` | `name`、`type`、`comment`、`column`（`@TableId/@TableField` 列名）、`value`（`static final` 的字面量）、`annotations` + `annotation_args`、`line` |
+| `constructors` | `name`、`parameters`、`annotations` + `annotation_args`、`line`。**刻意独立于 `methods`**：构造器没有返回类型，混进方法表会污染「返回类型」这一列 |
+| `methods` | `name`、`"类型 参数名"` 参数表、`return_type`、`logic_summary`、`key_dependencies`、`annotations` + `annotation_args`、`line` |
+| `relations` | `{to, kind}` 引用清单（`extends`/`implements`/`field`/`return`/`parameter`），全量解析后统一回填 `path` |
+| `logic_details` | 方法体里的 `if (条件) → 动作` 逐条成规则，带 `line`；MyBatis XML 则一条语句一条规则（带 `result_type`、`parameter_type`、`line`） |
 
-摘要优先取 Javadoc，没有才退回声明/首条语句；`// ===== 横幅 =====` 这类装饰性注释会被剥掉
+`annotation_args` 存的是**原始参数文本**（截断到 300 字符），不是解析后的结构 —— 注解参数写法
+太自由（命名参数、位置参数、数组、嵌套注解），存原文让 `query` 能直接按 URL 或列名命中，需要细看
+时再自己解读。
+
+`relations` 会**过滤掉 JDK 类型**（`String`/`Long`/`List`/`Map` 等）：不过滤的话一个 Service 的
+引用名额会被它们占满，真正的项目类反而挤不进来 —— 实测过滤前解析率 29%，过滤后 72%。
+按名字解析只能当提示：同简单名跨包时先到先得，有 `import` 时以 `import` 为准。
+
+摘要优先取 Javadoc，没有才退回声明/首条语句；字段注释优先取 Javadoc，没有才回退到
+`@Schema(description = …)` —— 团队写实体和 Req 用 `@Schema` 而不写 Javadoc，不回退的话
+一半以上字段没有中文说明。`// ===== 横幅 =====` 这类装饰性注释会被剥掉
 （保留文字、丢掉等号），因为本仓库到处都是它。
 
 **成本**：全量建一次 `wip-srv`（1698 文件 / 1517 个 Java）约 24 秒，纯 CPU、零 token；

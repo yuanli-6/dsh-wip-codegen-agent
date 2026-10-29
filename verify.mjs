@@ -629,6 +629,308 @@ check('a constructor is not mistaken for a method', () => {
   const name = entry.methods.find((method) => method.name === 'name')
   assert(name !== undefined, `methods are ${entry.methods.map((method) => method.name).join(', ')}`)
   assert(name.return_type === 'String', `name() return_type is "${name.return_type}"`)
+  const constructor = entry.constructors.find((item) => item.name === 'Foo')
+  assert(constructor !== undefined, `the constructor was dropped entirely: ${JSON.stringify(entry.constructors)}`)
+  assert(
+    JSON.stringify(constructor.parameters) === JSON.stringify(['Bar bar']),
+    `constructor parameters are ${JSON.stringify(constructor.parameters)}`
+  )
+})
+check('an interface constant carries its literal, because the literal is the whole meaning', () => {
+  // The field regex demands an explicit modifier, and interface members have
+  // none — so before this, a constants file indexed as zero fields.
+  const entry = indexModule.parseJavaSource(
+    [
+      'package com.demo.constant;',
+      '',
+      '/** 在制品常量。 */',
+      'public interface WipConstant {',
+      '    String COMPLETED = "在制品%s已完工确认";',
+      '',
+      '    /** 默认自检合格工序的工作中心 */',
+      '    Set<String> WORK_CENTERS = Set.of(',
+      '        "26",',
+      '        "0GL"',
+      '    );',
+      '}'
+    ].join('\n'),
+    'WipConstant.java'
+  )
+  assert(entry.classes[0].kind === 'interface', `kind is ${entry.classes[0].kind}`)
+  const constants = entry.classes[0].constants ?? []
+  assert(constants.length === 2, `expected 2 constants, got ${constants.length}: ${JSON.stringify(constants)}`)
+  const completed = constants.find((item) => item.name === 'COMPLETED')
+  assert(completed !== undefined, `constants are ${constants.map((item) => item.name).join(', ')}`)
+  assert(completed.value.includes('已完工确认'), `value is "${completed.value}"`)
+  assert(completed.line === 5, `COMPLETED line is ${completed.line}, expected 5`)
+  const centers = constants.find((item) => item.name === 'WORK_CENTERS')
+  assert(centers.comment === '默认自检合格工序的工作中心', `comment is "${centers.comment}"`)
+  assert(centers.value.includes('0GL'), `a multi-line value was cut: "${centers.value}"`)
+})
+check('a constant annotated on its own line still keeps its name and value', () => {
+  // `@Schema(...)` on the line above the declaration is how QuartzJobConstant
+  // is written. Stripping the annotation left the newline behind, the type
+  // pattern then matched nothing, and 73 constants indexed as zero.
+  const entry = indexModule.parseJavaSource(
+    [
+      'public interface QuartzJobConstant {',
+      '    @Schema(description = "默认启动的定时任务")',
+      '    List<QuartzJobCreateReq> DEFAULT_START_JOB_LIST = defaultStartJob();',
+      '',
+      '    String CRON = "0 0 1 * * ?";',
+      '}'
+    ].join('\n'),
+    'QuartzJobConstant.java'
+  )
+  const constants = entry.classes[0].constants ?? []
+  assert(
+    JSON.stringify(constants.map((item) => item.name)) === JSON.stringify(['DEFAULT_START_JOB_LIST', 'CRON']),
+    `constants are ${JSON.stringify(constants)}`
+  )
+  assert(
+    constants[0].value === 'defaultStartJob()',
+    `value is "${constants[0].value}"`
+  )
+})
+check('an enum keeps its constants, so a dictionary field can be read without the source', () => {
+  const entry = indexModule.parseJavaSource(
+    ['public enum BusinessType {', '    OTHER,', '    INSERT,', '    DELETE;', '', '    public String label() {', '        return name();', '    }', '}'].join('\n'),
+    'BusinessType.java'
+  )
+  const values = entry.classes[0].enum_values ?? []
+  assert(
+    JSON.stringify(values.map((item) => item.name)) === JSON.stringify(['OTHER', 'INSERT', 'DELETE']),
+    `enum values are ${JSON.stringify(values)}`
+  )
+  assert(values[0].line === 2, `OTHER line is ${values[0].line}, expected 2`)
+  assert(entry.methods.some((method) => method.name === 'label'), 'the method after the constants was lost')
+})
+check('an annotation keeps its arguments, so a URL and a column name stay searchable', () => {
+  // Dropping the arguments left every `@RequestMapping` as a bare name: the
+  // index could say a controller has one, never which path it serves.
+  const entry = indexModule.parseJavaSource(
+    [
+      'package com.demo.controller;',
+      '',
+      '@RestController',
+      '@RequestMapping("/attendance")',
+      'public class AttendanceController {',
+      '    @PostMapping("/sync")',
+      '    public Result<Void> sync() {',
+      '        return null;',
+      '    }',
+      '}'
+    ].join('\n'),
+    'AttendanceController.java'
+  )
+  const klass = entry.classes[0]
+  assert(klass.annotations.includes('RequestMapping'), `annotations are ${JSON.stringify(klass.annotations)}`)
+  assert(
+    klass.annotation_args.RequestMapping === '"/attendance"',
+    `class annotation args are ${JSON.stringify(klass.annotation_args)}`
+  )
+  const sync = entry.methods.find((method) => method.name === 'sync')
+  assert(sync.annotation_args.PostMapping === '"/sync"', `method annotation args are ${JSON.stringify(sync.annotation_args)}`)
+})
+check('an annotation whose arguments span lines is still read whole', () => {
+  const entry = indexModule.parseJavaSource(
+    [
+      '@RequestMapping(',
+      '    value = "/attendance",',
+      '    produces = "application/json"',
+      ')',
+      'public class AttendanceController {',
+      '}'
+    ].join('\n'),
+    'AttendanceController.java'
+  )
+  const args = entry.classes[0].annotation_args.RequestMapping ?? ''
+  assert(args.includes('/attendance'), `args are "${args}"`)
+  assert(args.includes('application/json'), `args are "${args}"`)
+})
+check('every declaration carries the line it starts on', () => {
+  // The project convention is "结论要带路径 + 行号"; an index without lines
+  // forces a full read just to cite one.
+  const entry = indexModule.parseJavaSource(
+    [
+      'package com.demo;',
+      '',
+      'public class A {',
+      '    private String name;',
+      '',
+      '    public void alpha() {',
+      '    }',
+      '}'
+    ].join('\n'),
+    'A.java'
+  )
+  assert(entry.classes[0].line === 3, `class line is ${entry.classes[0].line}, expected 3`)
+  assert(entry.fields[0].line === 4, `field line is ${entry.fields[0].line}, expected 4`)
+  assert(entry.methods[0].line === 6, `method line is ${entry.methods[0].line}, expected 6`)
+})
+check('a business rule carries the line of its own if, so it can be jumped to', () => {
+  // "O(1) 定位" is the whole point of indexing the branches: a rule without a
+  // line still forces a grep of the file to find the condition.
+  const entry = indexModule.parseJavaSource(
+    [
+      'package com.demo;', // 1
+      '', // 2
+      'public class A {', // 3
+      '    public void sync(AttendanceReq req) {', // 4
+      '        if (req == null) {', // 5
+      '            throw new IllegalArgumentException("空");', // 6
+      '        }', // 7
+      '        if (req.getBeginDate() == null) {', // 8
+      '            throw new IllegalArgumentException("开始日期不能为空");', // 9
+      '        }', // 10
+      '    }', // 11
+      '}' // 12
+    ].join('\n'),
+    'A.java'
+  )
+  const rules = entry.logic_details
+  assert(rules.length === 2, `expected 2 rules, got ${JSON.stringify(rules)}`)
+  assert(rules[0].line === 5, `the first rule is on line ${rules[0].line}, expected 5`)
+  assert(rules[1].line === 8, `the second rule is on line ${rules[1].line}, expected 8`)
+  assert(
+    rules.every((rule) => rule.rule_name.startsWith('sync')),
+    `rule names are ${rules.map((rule) => rule.rule_name).join(', ')}`
+  )
+  const text = indexModule.formatRead(
+    {
+      path: 'A.java',
+      directory: 'src',
+      file: { path: 'A.java', language: 'Java', summary: 'A' },
+      logic: entry
+    },
+    'A.java'
+  )
+  assert(text.includes('第 8 行'), `formatRead dropped the rule line: ${text}`)
+})
+check('an entity field keeps its column and its schema text', () => {
+  // Entities and Req objects document their fields with @Schema, never with
+  // Javadoc, which is why more than half the field comments were empty.
+  const entry = indexModule.parseJavaSource(
+    [
+      'public class WipTaskArrangement extends BaseDataEntity {',
+      '    @TableId(value = "task_arrangement_id")',
+      '    @Schema(description = "任务安排业务ID")',
+      '    private Long taskArrangementId;',
+      '',
+      '    @TableField(exist = false)',
+      '    @Schema(description = "班次名称")',
+      '    private String shiftName;',
+      '}'
+    ].join('\n'),
+    'WipTaskArrangement.java'
+  )
+  const id = entry.fields.find((field) => field.name === 'taskArrangementId')
+  assert(id.column === 'task_arrangement_id', `column is "${id.column}"`)
+  assert(id.comment === '任务安排业务ID', `comment is "${id.comment}"`)
+  const shift = entry.fields.find((field) => field.name === 'shiftName')
+  assert(shift.column === '', `a non-column field claimed column "${shift.column}"`)
+  assert(shift.comment === '班次名称', `comment is "${shift.comment}"`)
+})
+check('relations name the types a file leans on, and resolve to a path when indexed', () => {
+  const controller = indexModule.parseJavaSource(
+    [
+      'package com.demo.controller;',
+      '',
+      'import com.demo.service.AttendanceService;',
+      '',
+      'public class AttendanceController extends BaseController {',
+      '    private AttendanceService attendanceService;',
+      '',
+      '    public Result<Void> sync(AttendanceReq req) {',
+      '        return null;',
+      '    }',
+      '}'
+    ].join('\n'),
+    'src/AttendanceController.java'
+  )
+  const targets = controller.relations.map((relation) => relation.to)
+  assert(targets.includes('BaseController'), `relations are ${JSON.stringify(controller.relations)}`)
+  assert(targets.includes('AttendanceService'), `relations are ${JSON.stringify(controller.relations)}`)
+  assert(targets.includes('AttendanceReq'), `relations are ${JSON.stringify(controller.relations)}`)
+  const service = indexModule.parseJavaSource(
+    ['package com.demo.service;', '', 'public class AttendanceService {', '}'].join('\n'),
+    'src/AttendanceService.java'
+  )
+  indexModule.buildRelations({
+    'src/AttendanceController.java': controller,
+    'src/AttendanceService.java': service
+  })
+  const resolved = controller.relations.find((relation) => relation.to === 'AttendanceService')
+  assert(resolved.path === 'src/AttendanceService.java', `resolved path is "${resolved.path}"`)
+  const unresolved = controller.relations.find((relation) => relation.to === 'BaseController')
+  assert(unresolved.path === undefined, `an unindexed type claimed path "${unresolved.path}"`)
+})
+check('a mapper XML and its interface point at each other', () => {
+  const xml = indexModule.parseXmlMapper(
+    [
+      '<mapper namespace="com.demo.mapper.AttendanceMapper">',
+      '  <select id="selectPage" resultType="com.demo.rep.AttendanceResp">',
+      '    SELECT 1',
+      '  </select>',
+      '</mapper>'
+    ].join('\n'),
+    'resources/mapper/AttendanceMapper.xml'
+  )
+  assert(xml.package === 'com.demo.mapper.AttendanceMapper', `namespace is "${xml.package}"`)
+  assert(
+    xml.logic_details[0].result_type === 'com.demo.rep.AttendanceResp',
+    `result_type is "${xml.logic_details[0].result_type}"`
+  )
+  assert(xml.logic_details[0].line === 2, `statement line is ${xml.logic_details[0].line}, expected 2`)
+  const mapper = indexModule.parseJavaSource(
+    ['package com.demo.mapper;', '', 'public interface AttendanceMapper {', '    Object selectPage();', '}'].join('\n'),
+    'src/AttendanceMapper.java'
+  )
+  indexModule.buildRelations({
+    'src/AttendanceMapper.java': mapper,
+    'resources/mapper/AttendanceMapper.xml': xml
+  })
+  assert(
+    xml.mapper_interface === 'src/AttendanceMapper.java',
+    `mapper_interface is "${xml.mapper_interface}"`
+  )
+  assert(mapper.mapper_xml === 'resources/mapper/AttendanceMapper.xml', `mapper_xml is "${mapper.mapper_xml}"`)
+})
+check('a URL is found by the query even though it appears in no name', () => {
+  const entry = indexModule.parseJavaSource(
+    [
+      '@RestController',
+      '@RequestMapping("/attendance")',
+      'public class AttendanceController {',
+      '    @PostMapping("/getByPage")',
+      '    public Result<Void> getByPage() {',
+      '        return null;',
+      '    }',
+      '}'
+    ].join('\n'),
+    'src/AttendanceController.java'
+  )
+  const index = {
+    project_meta: { project_name: 'demo', last_updated: new Date().toISOString(), file_count: 1, global_summary: '' },
+    directory_index: [],
+    content_logic_index: { 'src/AttendanceController.java': entry }
+  }
+  const hits = indexModule.queryIndex(index, '/getByPage')
+  assert(hits.some((hit) => hit.kind === 'annotation'), `hits are ${JSON.stringify(hits)}`)
+})
+check('a narrowed read keeps the file context it was not asked to narrow', () => {
+  const entry = indexModule.parseJavaSource(
+    ['package com.demo;', '', 'public class A {', '    private String alpha;', '', '    public void beta() {', '    }', '}'].join('\n'),
+    'A.java'
+  )
+  const index = {
+    project_meta: { project_name: 'demo', last_updated: new Date().toISOString(), file_count: 1, global_summary: '' },
+    directory_index: [],
+    content_logic_index: { 'A.java': entry }
+  }
+  const narrowed = indexModule.readIndexEntry(index, 'A.java', 'beta')
+  assert(narrowed.logic.methods.length === 1, `methods are ${JSON.stringify(narrowed.logic.methods)}`)
+  assert(narrowed.logic.package === 'com.demo', `the package was dropped: ${JSON.stringify(narrowed.logic)}`)
 })
 check('a MyBatis mapper yields one logic rule per statement', () => {
   const entry = indexModule.parseXmlMapper(

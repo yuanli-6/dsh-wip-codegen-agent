@@ -77,8 +77,13 @@ export const INDEX_RELATIVE_PATH = `${INDEX_DIR}/${INDEX_FILE}`
  */
 export const CACHE_FILE = 'file-cache.json'
 
-/** Bumped when the extractor's output shape changes, so old caches are ignored. */
-export const INDEX_VERSION = 1
+/**
+ * Bumped when the extractor's output shape changes, so old caches are ignored.
+ *
+ * 2: annotation argument values, line numbers, imports, interface constants,
+ *    enum values, constructors and cross-file relations joined the entry.
+ */
+export const INDEX_VERSION = 2
 
 /** Listener lease. The spec's "有效期 30 分钟". */
 export const LEASE_MS = 30 * 60 * 1000
@@ -165,13 +170,18 @@ const LANGUAGE_BY_EXT = new Map([
 
 /** Per-file caps, so one pathological file cannot dominate the artefact. */
 const MAX_CLASSES = 40
-const MAX_FIELDS = 120
+const MAX_FIELDS = 160
 const MAX_METHODS = 200
+const MAX_CONSTRUCTORS = 40
+const MAX_IMPORTS = 80
+const MAX_RELATIONS = 40
 const MAX_DETAILS_PER_METHOD = 8
 const MAX_DETAILS_PER_FILE = 60
 const MAX_DEPENDENCIES = 8
 const SUMMARY_MAX = 200
 const LOGIC_MAX = 160
+/** Constants carry the literal itself, so they get a longer leash than prose. */
+const VALUE_MAX = 300
 
 // ---------------------------------------------------------------------------
 // paths
@@ -536,11 +546,19 @@ const CLASS_RE = new RegExp(
   'gm'
 )
 
-/** Field declaration, modifiers mandatory so locals are not picked up. */
+/**
+ * Field declaration, modifiers mandatory so locals are not picked up.
+ *
+ * The initializer is captured (group 4) rather than skipped: a constant written
+ * as a plain field (`static final String KEY = "wip:sync"`) carries its whole
+ * meaning in that literal, and `=([^;]*)` stops before the terminating `;`.
+ * The modifier group is captured (group 1) so that only `static final` fields
+ * are reported as carrying a constant value.
+ */
 const FIELD_RE = new RegExp(
   String.raw`^[ \t]*${ANNOTATION_PREFIX}` +
-    String.raw`(?:(?:private|protected|public|static|final|transient|volatile)\s+)+` +
-    String.raw`([\w$.<>\[\], \t?]+?)[ \t]+(\w+)\s*(?:=[^;]*)?;`,
+    String.raw`((?:(?:private|protected|public|static|final|transient|volatile)\s+)+)` +
+    String.raw`([\w$.<>\[\], \t?]+?)[ \t]+(\w+)\s*(?:=([^;]*))?;`,
   'gm'
 )
 
@@ -563,6 +581,477 @@ const METHOD_RE = new RegExp(
 
 /** Annotation name + raw argument text, used for class annotations. */
 const ANNOTATION_RE = /@([\w.]+)(?:\(((?:[^()]|\([^()]*\))*)\))?/g
+
+/** `package a.b.c;` at file scope. */
+const PACKAGE_RE = /^[ \t]*package\s+([\w$.]+)\s*;/m
+
+/** `import a.b.C;` / `import static a.b.C.d;` at file scope. */
+const IMPORT_RE = /^[ \t]*import\s+(?:static\s+)?([\w$.]+(?:\.\*)?)\s*;/gm
+
+/**
+ * Constructor declaration: modifiers, the type name, then a parameter list and
+ * an opening brace.
+ *
+ * Kept apart from `METHOD_RE` rather than merged into it. `METHOD_RE` cannot
+ * match a constructor at all (no return type), and a check locks that in, so
+ * constructors get their own scan and their own array instead of being smuggled
+ * into `methods` — `methods` must keep meaning "callable API".
+ */
+const CONSTRUCTOR_RE = new RegExp(
+  String.raw`^[ \t]*${ANNOTATION_PREFIX}` +
+    String.raw`((?:(?:public|protected|private)\s+)*)` +
+    String.raw`([\w$]+)\s*\(((?:[^()]|\([^()]*\))*)\)\s*(?:throws[^{;]*)?\{`,
+  'gm'
+)
+
+/**
+ * Net parenthesis count of one line, ignoring string literals and line comments.
+ *
+ * Used to walk backwards over an annotation that spans several lines: a line
+ * that closes more parentheses than it opens belongs to an annotation whose
+ * opening `@Name(` is further up.
+ *
+ * @param {string} line - one source line.
+ * @returns {number} `(` minus `)`.
+ */
+function parenDelta(line) {
+  const text = line.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/\/\/.*$/, '')
+  let delta = 0
+  for (const char of text) {
+    if (char === '(') delta += 1
+    else if (char === ')') delta -= 1
+  }
+  return delta
+}
+
+/**
+ * Annotations attached to a declaration, with their argument text.
+ *
+ * The argument text is the point. `@RequestMapping("/taskArrangement")` reduced
+ * to the bare name `RequestMapping` says nothing about the URL, and
+ * `@TableField(value = "work_area")` reduced to `TableField` loses the very
+ * column mapping an entity exists to express.
+ *
+ * Two places are read, because a declaration header reaches the caller in two
+ * shapes. When the declaration regex matched on the declaration line itself the
+ * annotations sit on the lines above, and the walk goes upwards. When it matched
+ * on an annotation line — which happens as soon as one annotation wraps its
+ * arguments across lines, since `ANNOTATION_PREFIX` spans newlines inside the
+ * parentheses — the annotations are inside `header` instead. Both are read and
+ * merged in source order.
+ *
+ * The upward walk keeps two kinds of line: one that starts with `@`, and one that
+ * leaves the parenthesis balance negative, which is how the tail of a multi-line
+ * annotation is recognised. A blank line or a comment ends it, so a declaration
+ * with no annotations costs one comparison.
+ *
+ * @param {string[]} lines - file split on newlines.
+ * @param {number} lineIndex - 0-based line the declaration regex matched on.
+ * @param {string} [header] - the matched declaration header; its annotation
+ *   prefix is read too, because that is where a same-line annotation lives.
+ * @returns {{names: string[], args: Record<string, string>}} names in source
+ *   order, and the raw argument text of every annotation that has any.
+ */
+function annotationsAbove(lines, lineIndex, header = '') {
+  /** @type {string[]} */
+  const collected = []
+  let balance = 0
+  for (let up = lineIndex - 1; up >= 0; up -= 1) {
+    const line = lines[up]
+    const trimmed = line.trim()
+    if (trimmed === '') break
+    if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) break
+    const opens = trimmed.startsWith('@')
+    // Keep a line when it opens an annotation, or when it closes one that is
+    // still open above; anything else is the previous declaration.
+    if (!opens && balance + parenDelta(line) >= 0) break
+    collected.unshift(line)
+    balance += parenDelta(line)
+  }
+
+  /** @type {string[]} */
+  const texts = []
+  if (collected.length > 0) texts.push(collected.join('\n'))
+  if (header !== '') texts.push(annotationPrefix(header))
+
+  /** @type {string[]} */
+  const names = []
+  /** @type {Record<string, string>} */
+  const args = {}
+  for (const text of texts) {
+    for (const matched of text.matchAll(ANNOTATION_RE)) {
+      const name = matched[1].includes('.') ? (matched[1].split('.').pop() ?? matched[1]) : matched[1]
+      if (!names.includes(name)) names.push(name)
+      const value = collapse(matched[2] ?? '')
+      if (value !== '') args[name] = truncate(value, VALUE_MAX)
+    }
+  }
+  return { names, args }
+}
+
+/**
+ * The `description = "…"` text of a `@Schema`.
+ *
+ * This is the only Chinese wording many entity and Req fields ever get — the
+ * team writes `@Schema(description = "工区")` instead of a Javadoc — so leaving
+ * it out is why more than half the indexed fields had no comment at all.
+ *
+ * @param {Record<string, string>} args - annotation arguments.
+ * @returns {string} the description, or ''.
+ */
+function schemaText(args) {
+  const raw = args.Schema ?? ''
+  if (raw === '') return ''
+  const named = /\bdescription\s*=\s*"((?:[^"\\]|\\.)*)"/.exec(raw)
+  if (named !== null) return truncate(named[1], SUMMARY_MAX)
+  const bare = /^"((?:[^"\\]|\\.)*)"$/.exec(raw.trim())
+  return bare === null ? '' : truncate(bare[1], SUMMARY_MAX)
+}
+
+/**
+ * The column a `@TableField` / `@TableId` binds the field to.
+ *
+ * `@TableField(exist = false)` has no column and yields ''.
+ *
+ * @param {Record<string, string>} args - annotation arguments.
+ * @returns {string} the column name, or ''.
+ */
+function columnText(args) {
+  for (const key of ['TableId', 'TableField']) {
+    const raw = args[key]
+    if (raw === undefined) continue
+    const named = /\bvalue\s*=\s*"([^"]+)"/.exec(raw)
+    if (named !== null) return named[1]
+    const bare = /^"([^"]+)"$/.exec(raw.trim())
+    if (bare !== null) return bare[1]
+  }
+  return ''
+}
+
+/**
+ * Types that can never be a file in this project.
+ *
+ * Without this the relations list fills with `String`, `List` and `Long`, and
+ * since it is capped, the handful of project classes that actually matter get
+ * pushed out — measured on wip-srv, 71% of relations were JDK types.
+ */
+const JAVA_BUILTIN_TYPES = new Set([
+  'String', 'CharSequence', 'Object', 'Number', 'Integer', 'Long', 'Short', 'Byte', 'Double', 'Float',
+  'Boolean', 'Character', 'Void', 'BigDecimal', 'BigInteger', 'Math', 'System', 'Class', 'Thread',
+  'Throwable', 'Exception', 'RuntimeException', 'Error', 'Iterable', 'Collection', 'List', 'Set', 'Map',
+  'Queue', 'Deque', 'ArrayList', 'LinkedList', 'HashMap', 'LinkedHashMap', 'TreeMap', 'HashSet',
+  'LinkedHashSet', 'TreeSet', 'Arrays', 'Collections', 'Objects', 'Optional', 'Stream', 'Collectors',
+  'Comparator', 'Iterator', 'Date', 'Calendar', 'LocalDate', 'LocalDateTime', 'LocalTime', 'Instant',
+  'Duration', 'Period', 'ZoneId', 'TimeZone', 'SimpleDateFormat', 'DateFormat', 'StringBuilder',
+  'StringBuffer', 'Pattern', 'Matcher', 'Serializable', 'Cloneable', 'Comparable', 'Runnable',
+  'Callable', 'Future', 'CompletableFuture', 'ExecutorService', 'ThreadPoolExecutor', 'InputStream',
+  'OutputStream', 'Reader', 'Writer', 'File', 'Path', 'Files', 'URI', 'URL', 'UUID', 'Random',
+  'AtomicInteger', 'AtomicLong', 'AtomicBoolean', 'AtomicReference', 'ConcurrentHashMap',
+  'CopyOnWriteArrayList', 'CountDownLatch', 'Semaphore', 'Lock', 'ReentrantLock', 'TimeUnit',
+  'Function', 'Supplier', 'Consumer', 'Predicate', 'BiFunction', 'UnaryOperator', 'T', 'E', 'K', 'V',
+  'R', 'ID'
+])
+
+/** Capitalised type names mentioned by a type expression (`Map<String, Foo>` → Foo). */
+function typeNames(type) {
+  /** @type {string[]} */
+  const names = []
+  for (const matched of collapse(type).matchAll(/\b([A-Z][\w$]*)\b/g)) {
+    const name = matched[1]
+    if (JAVA_BUILTIN_TYPES.has(name)) continue
+    if (!names.includes(name)) names.push(name)
+  }
+  return names
+}
+
+/** Record one outbound reference, first occurrence wins. */
+function addRef(refs, seen, to, kind) {
+  if (to === '') return
+  const key = `${kind}:${to}`
+  if (seen.has(key)) return
+  seen.add(key)
+  refs.push({ to, kind })
+}
+
+/**
+ * 1-based line of a declaration's own line.
+ *
+ * A declaration regex starts at the first annotation, so the line it reports is
+ * the annotation's. The offset that matters for "go look at this" is the name's.
+ *
+ * @param {number[]} starts - line start offsets.
+ * @param {number} base - absolute offset of `raw[0]`.
+ * @param {string} raw - the matched declaration header.
+ * @param {string} name - the declared name.
+ * @returns {number} 1-based line.
+ */
+function declarationLine(starts, base, raw, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  let last = 0
+  for (const matched of raw.matchAll(new RegExp(`\\b${escaped}\\b`, 'g'))) last = matched.index ?? 0
+  return lineAt(starts, base + last) + 1
+}
+
+/**
+ * The annotation prefix of a declaration header, or ''.
+ *
+ * Taken from the header rather than from the lines above, because a declaration
+ * regex starts with `ANNOTATION_PREFIX` and therefore swallows every annotation
+ * written on the same line as the declaration. `ANNOTATION_PREFIX` already
+ * balances the parentheses, so `@PostMapping("/sync")` comes back whole — which
+ * a search for the declared name could not do, since `sync` also occurs inside
+ * that string literal.
+ *
+ * @param {string} header - matched declaration header.
+ * @returns {string} the leading annotations with their arguments, or ''.
+ */
+function annotationPrefix(header) {
+  const matched = new RegExp(`^[ \\t]*${ANNOTATION_PREFIX}`).exec(header)
+  return matched === null ? '' : matched[0]
+}
+
+/**
+ * Skip leading whitespace and comments.
+ *
+ * A member's statement text starts right after the previous `;` or `}`, so it
+ * carries the blank lines and the Javadoc that precede the declaration. The
+ * offset is needed because it becomes the line number.
+ *
+ * @param {string} text - statement text.
+ * @returns {number} offset of the first real character, or `text.length`.
+ */
+function skipTrivia(text) {
+  let index = 0
+  while (index < text.length) {
+    const char = text[index]
+    if (char === ' ' || char === '\t' || char === '\r' || char === '\n') {
+      index += 1
+      continue
+    }
+    if (char === '/' && text[index + 1] === '/') {
+      const newline = text.indexOf('\n', index)
+      index = newline < 0 ? text.length : newline + 1
+      continue
+    }
+    if (char === '/' && text[index + 1] === '*') {
+      const close = text.indexOf('*/', index + 2)
+      index = close < 0 ? text.length : close + 2
+      continue
+    }
+    break
+  }
+  return index
+}
+
+/** Strip the annotations that precede a member so the type can be read. */
+function stripAnnotations(text) {
+  let rest = text
+  for (;;) {
+    // `\s*` not `[ \t]*`: an annotation sits on its own line as often as not,
+    // and leaving the newline behind makes the type pattern match nothing.
+    const next = rest.replace(/^@[\w.]+(?:\((?:[^()]|\([^()]*\))*\))?\s*/, '')
+    if (next === rest) return rest
+    rest = next
+  }
+}
+
+/**
+ * Constants declared in an interface body.
+ *
+ * `FIELD_RE` demands an explicit modifier, which an interface constant never
+ * has — `String KEY = "x";` inside an `interface` is implicitly
+ * `public static final`. That is why a constants interface such as
+ * `WipConstant` indexed with zero fields, losing every literal it exists to
+ * hold.
+ *
+ * @param {string} body - text between the interface braces.
+ * @param {number} base - absolute offset of `body[0]` in the file.
+ * @returns {{name: string, type: string, value: string, offset: number}[]} the constants.
+ */
+function interfaceConstants(body, base) {
+  /** @type {{name: string, type: string, value: string, offset: number}[]} */
+  const constants = []
+  for (const statement of topLevelStatements(body)) {
+    const lead = skipTrivia(statement.text)
+    const raw = stripAnnotations(statement.text.slice(lead))
+    const matched = /^([\w$.<>\[\], \t?]+?)[ \t]+(\w+)\s*=\s*([\s\S]*)$/.exec(raw)
+    if (matched === null) continue
+    const type = collapse(matched[1])
+    if (!isPlausibleType(type)) continue
+    constants.push({
+      name: matched[2],
+      type,
+      value: truncate(collapse(matched[3]), VALUE_MAX),
+      offset: base + statement.offset + lead
+    })
+  }
+  return constants
+}
+
+/**
+ * Enum constants of an enum body, with their constructor arguments.
+ *
+ * `BusinessType.INSERT("新增")` is the whole point of that file: the value is
+ * the label the UI shows. Indexing the enum without its constants left the
+ * entry with nothing but a name.
+ *
+ * @param {string} body - text between the enum braces.
+ * @param {number} base - absolute offset of `body[0]` in the file.
+ * @returns {{name: string, args: string, offset: number}[]} the constants.
+ */
+function enumValues(body, base) {
+  const cut = firstTopLevelSemicolon(body)
+  const head = cut < 0 ? body : body.slice(0, cut)
+  /** @type {{name: string, args: string, offset: number}[]} */
+  const values = []
+  for (const part of splitTopLevel(head, ',')) {
+    const lead = skipTrivia(part.text)
+    const raw = collapse(part.text.slice(lead))
+    const name = /^([A-Za-z_$][\w$]*)/.exec(raw)?.[1] ?? ''
+    if (name === '') continue
+    let args = ''
+    const open = raw.indexOf('(')
+    if (open >= 0) {
+      let depth = 0
+      for (let index = open; index < raw.length; index += 1) {
+        if (raw[index] === '(') depth += 1
+        else if (raw[index] === ')') {
+          depth -= 1
+          if (depth === 0) {
+            args = raw.slice(open + 1, index)
+            break
+          }
+        }
+      }
+    }
+    values.push({ name, args: truncate(collapse(args), VALUE_MAX), offset: base + part.offset + lead })
+  }
+  return values
+}
+
+/**
+ * Depth-0 `;`-terminated statements inside a class body.
+ *
+ * A `}` that closes back to depth 0 also starts a new statement, so a method
+ * body does not swallow the member declared after it. Only the interface /
+ * enum member pass uses this; the field and method scans stay regex-driven.
+ *
+ * @param {string} body - text between the enclosing braces.
+ * @returns {{text: string, offset: number}[]} statements, offsets relative to `body`.
+ */
+function topLevelStatements(body) {
+  /** @type {{text: string, offset: number}[]} */
+  const statements = []
+  let depth = 0
+  let start = 0
+  let index = 0
+  while (index < body.length) {
+    const char = body[index]
+    if (char === '"' || char === "'") {
+      index = skipString(body, index)
+      continue
+    }
+    if (char === '/' && body[index + 1] === '/') {
+      const newline = body.indexOf('\n', index)
+      index = newline < 0 ? body.length : newline + 1
+      continue
+    }
+    if (char === '/' && body[index + 1] === '*') {
+      const close = body.indexOf('*/', index + 2)
+      index = close < 0 ? body.length : close + 2
+      continue
+    }
+    if (char === '{' || char === '(' || char === '[') {
+      depth += 1
+      index += 1
+      continue
+    }
+    if (char === '}' || char === ')' || char === ']') {
+      depth = Math.max(0, depth - 1)
+      if (char === '}' && depth === 0) start = index + 1
+      index += 1
+      continue
+    }
+    if (char === ';' && depth === 0) {
+      statements.push({ text: body.slice(start, index), offset: start })
+      start = index + 1
+    }
+    index += 1
+  }
+  return statements
+}
+
+/** Offset of the first `;` at nesting depth 0, or -1. */
+function firstTopLevelSemicolon(body) {
+  let depth = 0
+  let index = 0
+  while (index < body.length) {
+    const char = body[index]
+    if (char === '"' || char === "'") {
+      index = skipString(body, index)
+      continue
+    }
+    if (char === '/' && body[index + 1] === '/') {
+      const newline = body.indexOf('\n', index)
+      index = newline < 0 ? body.length : newline + 1
+      continue
+    }
+    if (char === '/' && body[index + 1] === '*') {
+      const close = body.indexOf('*/', index + 2)
+      index = close < 0 ? body.length : close + 2
+      continue
+    }
+    if (char === '{' || char === '(' || char === '[') depth += 1
+    else if (char === '}' || char === ')' || char === ']') depth = Math.max(0, depth - 1)
+    else if (char === ';' && depth === 0) return index
+    index += 1
+  }
+  return -1
+}
+
+/**
+ * Split on a separator that only counts at nesting depth 0.
+ *
+ * An enum constant list is comma-separated, but a constant may carry arguments
+ * (`A(1, "x")`) or a body, so a plain `split(',')` cuts in the wrong place.
+ *
+ * @param {string} text - text to split.
+ * @param {string} separator - single-character separator.
+ * @returns {{text: string, offset: number}[]} the parts, offsets relative to `text`.
+ */
+function splitTopLevel(text, separator) {
+  /** @type {{text: string, offset: number}[]} */
+  const parts = []
+  let depth = 0
+  let start = 0
+  let index = 0
+  while (index < text.length) {
+    const char = text[index]
+    if (char === '"' || char === "'") {
+      index = skipString(text, index)
+      continue
+    }
+    if (char === '/' && text[index + 1] === '/') {
+      const newline = text.indexOf('\n', index)
+      index = newline < 0 ? text.length : newline + 1
+      continue
+    }
+    if (char === '/' && text[index + 1] === '*') {
+      const close = text.indexOf('*/', index + 2)
+      index = close < 0 ? text.length : close + 2
+      continue
+    }
+    if (char === '<' || char === '{' || char === '(' || char === '[') depth += 1
+    else if (char === '>' || char === '}' || char === ')' || char === ']') depth = Math.max(0, depth - 1)
+    else if (char === separator && depth === 0) {
+      parts.push({ text: text.slice(start, index), offset: start })
+      start = index + 1
+    }
+    index += 1
+  }
+  parts.push({ text: text.slice(start), offset: start })
+  return parts
+}
 
 /**
  * Split a parameter list on top-level commas.
@@ -670,13 +1159,31 @@ function collectDependencies(body) {
   return found.slice(0, MAX_DEPENDENCIES)
 }
 
-/** `if (cond) { action }` pairs from a method body. */
-function collectRules(body, methodName) {
-  /** @type {{rule_name: string, description: string}[]} */
+/**
+ * `if (cond) { action }` pairs from a method body.
+ *
+ * Each rule carries the absolute 1-based line of its `if`, so a reader can jump
+ * straight to the branch instead of grepping the file for the condition text.
+ *
+ * @param {string} body - the method body, as sliced out by `scanBlock`.
+ * @param {string} methodName - owner of the rules.
+ * @param {number} [bodyStart] - absolute offset of `body` in the file.
+ * @param {number[]} [starts] - line starts of the whole file, from `lineStarts`.
+ * @returns {{rule_name: string, description: string, line?: number}[]} the rules.
+ */
+function collectRules(body, methodName, bodyStart, starts) {
+  /** @type {{rule_name: string, description: string, line?: number}[]} */
   const rules = []
   const lines = body.split('\n')
+  const locatable = typeof bodyStart === 'number' && Array.isArray(starts)
+  let offset = 0
   for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index].trim()
+    const raw = lines[index]
+    const lineStart = offset
+    // +1 for the '\n' that split() removed; CRLF sources keep the '\r' in raw,
+    // which shifts nothing because it trails the line it belongs to.
+    offset += raw.length + 1
+    const line = raw.trim()
     const condition = /^(?:\}\s*)?if\s*\((.+)\)\s*\{?$/.exec(line)
     if (condition === null) continue
     let action = ''
@@ -687,13 +1194,34 @@ function collectRules(body, methodName) {
       break
     }
     if (action === '') continue
-    rules.push({
+    /** @type {{rule_name: string, description: string, line?: number}} */
+    const rule = {
       rule_name: `${methodName} · 条件 ${rules.length + 1}`,
       description: truncate(`${collapse(condition[1])} → ${action}`, LOGIC_MAX)
-    })
+    }
+    if (locatable) {
+      // Point at the `if` itself, not at the line's indentation: the regex
+      // allows a leading `}`, so the keyword is not always the first token.
+      const leading = raw.length - raw.trimStart().length
+      const ifAt = raw.indexOf('if', leading)
+      const column = ifAt < 0 ? leading : ifAt
+      rule.line = lineAt(starts, bodyStart + lineStart + column) + 1
+    }
+    rules.push(rule)
     if (rules.length >= MAX_DETAILS_PER_METHOD) break
   }
   return rules
+}
+
+/**
+ * The type part of one `"类型 参数名"` string.
+ *
+ * @param {string} parameter - as produced by `parseParameters`.
+ * @returns {string} the type, or ''.
+ */
+function parameterType(parameter) {
+  const cut = parameter.lastIndexOf(' ')
+  return cut < 0 ? '' : parameter.slice(0, cut)
 }
 
 /**
@@ -701,56 +1229,132 @@ function collectRules(body, methodName) {
  *
  * @param {string} source - file text.
  * @param {string} relPath - path relative to the project root.
- * @returns {{classes: object[], fields: object[], methods: object[], logic_details: object[]}} the entry.
+ * @returns {object} the entry.
  */
 export function parseJavaSource(source, relPath) {
   const text = source.replace(/^\uFEFF/, '')
   const lines = text.split('\n')
   const starts = lineStarts(text)
 
+  /** @type {string[]} */
+  const imports = []
+  for (const matched of text.matchAll(IMPORT_RE)) {
+    if (imports.length >= MAX_IMPORTS) break
+    imports.push(matched[1])
+  }
+
   /** @type {object[]} */
   const classes = []
+  /** @type {Set<string>} */
+  const classNames = new Set()
   for (const matched of text.matchAll(CLASS_RE)) {
     if (classes.length >= MAX_CLASSES) break
-    const index = lineAt(starts, matched.index ?? 0)
+    const header = matched[0]
+    const kind = matched[2]
+    const name = matched[3]
+    const base = matched.index ?? 0
+    const index = lineAt(starts, base)
     const heritage = parseHeritage(matched[4] ?? '')
-    const annotations = []
-    for (let up = index - 1; up >= 0 && lines[up].trim().startsWith('@'); up -= 1) {
-      for (const annotation of lines[up].matchAll(ANNOTATION_RE)) annotations.unshift(annotation[1])
-    }
+    const { names, args } = annotationsAbove(lines, index, header)
     const doc = commentAbove(lines, index)
-    classes.push({
-      name: matched[3],
+    classNames.add(name)
+
+    /** @type {Record<string, unknown>} */
+    const entry = {
+      name,
+      kind,
       extends: heritage.extends[0] ?? '',
       implements: heritage.implements,
-      annotations,
+      annotations: names,
+      annotation_args: args,
+      line: declarationLine(starts, base, header, name),
       summary:
         doc !== ''
           ? doc
           : truncate(
               [
-                matched[2],
-                matched[3],
+                kind,
+                name,
                 heritage.extends.length > 0 ? `extends ${heritage.extends.join(', ')}` : '',
                 heritage.implements.length > 0 ? `implements ${heritage.implements.join(', ')}` : ''
               ]
                 .filter((part) => part !== '')
                 .join(' ')
             )
-    })
+    }
+
+    // `header` ends with the class's own `{`, so the block scan starts there
+    // rather than past it — otherwise it would take the first nested brace.
+    const block = scanBlock(text, base + header.length - 1)
+    if (block !== null && kind === 'interface') {
+      const constants = interfaceConstants(block.body, block.start).map((constant) => {
+        const lineIndex = lineAt(starts, constant.offset)
+        return {
+          name: constant.name,
+          type: constant.type,
+          value: constant.value,
+          comment: commentAbove(lines, lineIndex),
+          line: lineIndex + 1
+        }
+      })
+      if (constants.length > 0) entry.constants = constants
+    }
+    if (block !== null && kind === 'enum') {
+      const values = enumValues(block.body, block.start).map((value) => ({
+        name: value.name,
+        args: value.args,
+        line: lineAt(starts, value.offset) + 1
+      }))
+      if (values.length > 0) entry.enum_values = values
+    }
+    classes.push(entry)
   }
 
   /** @type {object[]} */
   const fields = []
   for (const matched of text.matchAll(FIELD_RE)) {
     if (fields.length >= MAX_FIELDS) break
-    const type = collapse(matched[1])
+    const type = collapse(matched[2])
     if (!isPlausibleType(type)) continue
-    const index = lineAt(starts, matched.index ?? 0)
+    const header = matched[0]
+    const name = matched[3]
+    const base = matched.index ?? 0
+    const index = lineAt(starts, base)
+    const { names, args } = annotationsAbove(lines, index, header)
+    const doc = commentAbove(lines, index)
+    // Only a `static final` field is a constant; a plain field's initializer is
+    // just a default value and would only add noise.
+    const constant = /\bstatic\b/.test(matched[1]) && /\bfinal\b/.test(matched[1])
     fields.push({
-      name: matched[2],
+      name,
       type,
-      comment: commentAbove(lines, index)
+      comment: doc !== '' ? doc : schemaText(args),
+      column: columnText(args),
+      value: constant ? truncate(collapse(matched[4] ?? ''), VALUE_MAX) : '',
+      annotations: names,
+      annotation_args: args,
+      line: declarationLine(starts, base, header, name)
+    })
+  }
+
+  /** @type {object[]} */
+  const constructors = []
+  for (const matched of text.matchAll(CONSTRUCTOR_RE)) {
+    if (constructors.length >= MAX_CONSTRUCTORS) break
+    const header = matched[0]
+    const name = matched[2]
+    // Without a return type any `foo(…) {` looks like a constructor, so only the
+    // names this file actually declares are accepted.
+    if (!classNames.has(name)) continue
+    const base = matched.index ?? 0
+    const index = lineAt(starts, base)
+    const { names, args } = annotationsAbove(lines, index, header)
+    constructors.push({
+      name,
+      parameters: parseParameters(matched[3] ?? ''),
+      annotations: names,
+      annotation_args: args,
+      line: declarationLine(starts, base, header, name)
     })
   }
 
@@ -762,10 +1366,12 @@ export function parseJavaSource(source, relPath) {
     if (methods.length >= MAX_METHODS) break
     const type = collapse(matched[2])
     if (!isPlausibleType(type)) continue
+    const header = matched[0]
     const name = matched[3]
     if (JAVA_KEYWORDS.has(name)) continue
-    const offset = (matched.index ?? 0) + matched[0].length
-    const index = lineAt(starts, matched.index ?? 0)
+    const base = matched.index ?? 0
+    const offset = base + header.length
+    const index = lineAt(starts, base)
 
     // A `;` before the next `{` means an abstract / interface method.
     const semi = text.indexOf(';', offset)
@@ -775,23 +1381,51 @@ export function parseJavaSource(source, relPath) {
     const body = block?.body ?? ''
     const doc = commentAbove(lines, index)
     const dependencies = collectDependencies(body)
+    const { names, args } = annotationsAbove(lines, index, header)
     methods.push({
       name,
       parameters: parseParameters(matched[4] ?? ''),
       return_type: type,
       logic_summary: doc !== '' ? doc : firstStatement(body),
-      key_dependencies: dependencies
+      key_dependencies: dependencies,
+      annotations: names,
+      annotation_args: args,
+      line: declarationLine(starts, base, header, name)
     })
 
     if (body !== '' && logicDetails.length < MAX_DETAILS_PER_FILE) {
-      logicDetails.push(...collectRules(body, name))
+      // block.start is the absolute offset of `body`, so every rule can carry
+      // the line of its own `if` and be jumped to directly.
+      logicDetails.push(...collectRules(body, name, block?.start, starts))
+    }
+  }
+
+  /** @type {{to: string, kind: string}[]} */
+  const relations = []
+  /** @type {Set<string>} */
+  const seen = new Set()
+  for (const item of classes) {
+    addRef(relations, seen, item.extends, 'extends')
+    for (const target of item.implements) addRef(relations, seen, target, 'implements')
+  }
+  for (const field of fields) {
+    for (const target of typeNames(field.type)) addRef(relations, seen, target, 'field')
+  }
+  for (const method of methods) {
+    for (const target of typeNames(method.return_type)) addRef(relations, seen, target, 'return')
+    for (const parameter of method.parameters) {
+      for (const target of typeNames(parameterType(parameter))) addRef(relations, seen, target, 'parameter')
     }
   }
 
   return {
+    package: PACKAGE_RE.exec(text)?.[1] ?? '',
+    imports,
     classes,
     fields,
+    constructors,
     methods,
+    relations: relations.slice(0, MAX_RELATIONS),
     logic_details: logicDetails.slice(0, MAX_DETAILS_PER_FILE)
   }
 }
@@ -800,8 +1434,14 @@ export function parseJavaSource(source, relPath) {
 // MyBatis XML
 // ---------------------------------------------------------------------------
 
-/** `<select|insert|update|delete id="…">` inside a mapper file. */
-const STATEMENT_RE = /<(select|insert|update|delete)\s+([^>]*?)id\s*=\s*"([^"]+)"[^>]*>/gi
+/**
+ * `<select|insert|update|delete …>` inside a mapper file.
+ *
+ * The whole tag is captured, not just what precedes `id`: `resultType` and
+ * `parameterType` are conventionally written after `id`, and a pattern that
+ * stops at `id` silently loses them.
+ */
+const STATEMENT_RE = /<(select|insert|update|delete)\s+([^>]*?)\/?>/gi
 
 /**
  * Extract the entry for a MyBatis mapper file.
@@ -810,45 +1450,66 @@ const STATEMENT_RE = /<(select|insert|update|delete)\s+([^>]*?)id\s*=\s*"([^"]+)
  * query backs which method. They are the reason a Mapper XML is worth indexing
  * at all, so each one becomes a `logic_details` rule.
  *
+ * The namespace is kept as its own field, not just baked into a summary string:
+ * it is the fully-qualified name of the Mapper interface, and it is the only
+ * thing that ties the XML to the Java file that declares those statements.
+ *
  * @param {string} source - file text.
  * @param {string} relPath - path relative to the project root.
- * @returns {{classes: object[], fields: object[], methods: object[], logic_details: object[]} | null} the entry, or null when this is not a mapper.
+ * @returns {object | null} the entry, or null when this is not a mapper.
  */
 export function parseXmlMapper(source, relPath) {
   const text = source.replace(/^\uFEFF/, '')
   if (!/<mapper\b/i.test(text)) return null
   const namespace = /<mapper\b[^>]*namespace\s*=\s*"([^"]+)"/i.exec(text)?.[1] ?? ''
+  const starts = lineStarts(text)
 
-  /** @type {{rule_name: string, description: string}[]} */
+  /** @type {object[]} */
   const details = []
   for (const matched of text.matchAll(STATEMENT_RE)) {
     if (details.length >= MAX_DETAILS_PER_FILE) break
     const tag = matched[1].toLowerCase()
-    const id = matched[3]
+    const attributes = matched[2]
+    const id = /\bid\s*=\s*"([^"]+)"/.exec(attributes)?.[1] ?? ''
+    // Without an id there is nothing to call the statement, and MyBatis would
+    // not load it either — `<selectKey>` and friends are skipped this way.
+    if (id === '') continue
     const start = (matched.index ?? 0) + matched[0].length
     const close = text.indexOf('</', start)
     const sql = collapse(text.slice(start, close < 0 ? Math.min(start + 400, text.length) : close))
     details.push({
       rule_name: `${tag}:${id}`,
-      description: truncate(`${namespace === '' ? '' : `${namespace.split('.').pop()}.`}${id} — ${sql}`, LOGIC_MAX)
+      description: truncate(`${namespace === '' ? '' : `${namespace.split('.').pop()}.`}${id} — ${sql}`, LOGIC_MAX),
+      statement: tag,
+      id,
+      result_type: /\bresultType\s*=\s*"([^"]+)"/.exec(attributes)?.[1] ?? '',
+      parameter_type: /\bparameterType\s*=\s*"([^"]+)"/.exec(attributes)?.[1] ?? '',
+      line: lineAt(starts, matched.index ?? 0) + 1
     })
   }
 
   return {
+    package: namespace,
+    imports: [],
     classes:
       namespace === ''
         ? []
         : [
             {
               name: namespace.split('.').pop() ?? namespace,
+              kind: 'mapper',
               extends: '',
               implements: [],
               annotations: ['MyBatisMapper'],
+              annotation_args: { namespace },
+              line: lineAt(starts, /<mapper\b/.exec(text)?.index ?? 0) + 1,
               summary: `MyBatis Mapper · namespace ${namespace}`
             }
           ],
     fields: [],
+    constructors: [],
     methods: [],
+    relations: [],
     logic_details: details
   }
 }
@@ -865,7 +1526,15 @@ export function extractContentLogic(source, relPath) {
   const language = languageOf(relPath)
   if (language === 'Java') {
     const entry = parseJavaSource(source, relPath)
-    return entry.classes.length === 0 && entry.methods.length === 0 ? null : entry
+    // A file that only declares constants still carries its literals, and those
+    // literals are often the whole point of the file (`WipConstant`), so a
+    // non-empty `fields` keeps it in the index too.
+    const empty =
+      entry.classes.length === 0 &&
+      entry.methods.length === 0 &&
+      entry.constructors.length === 0 &&
+      entry.fields.length === 0
+    return empty ? null : entry
   }
   if (language === 'XML') return parseXmlMapper(source, relPath)
   return null
@@ -988,6 +1657,64 @@ export function summarizeDirectory(relDir, children) {
 // ---------------------------------------------------------------------------
 // building
 // ---------------------------------------------------------------------------
+
+/**
+ * Join the entries to each other, once every file has been parsed.
+ *
+ * A single file cannot answer "who uses this", so the references collected
+ * during parsing are resolved here against the whole project: a simple name
+ * becomes a path, a MyBatis namespace becomes the Java interface that declares
+ * those statements, and that interface gets a pointer back at its XML. What
+ * comes out is the chain the model actually needs — Service → Mapper → XML —
+ * without reading any of the three files.
+ *
+ * Resolution is by name, so it can only ever be a hint: two classes with the
+ * same simple name in different packages resolve to whichever was indexed
+ * first, and an import wins over that guess whenever the file has one.
+ *
+ * @param {Record<string, object>} contentLogic - entries keyed by relative path.
+ */
+export function buildRelations(contentLogic) {
+  /** @type {Map<string, string>} fully-qualified name → path. */
+  const byQualified = new Map()
+  /** @type {Map<string, string>} simple name → path, first wins. */
+  const bySimple = new Map()
+
+  for (const [rel, entry] of Object.entries(contentLogic)) {
+    for (const item of entry.classes ?? []) {
+      if (typeof item.name !== 'string' || item.name === '') continue
+      if (!bySimple.has(item.name)) bySimple.set(item.name, rel)
+      const qualified = entry.package === '' ? item.name : `${entry.package}.${item.name}`
+      if (!byQualified.has(qualified)) byQualified.set(qualified, rel)
+    }
+  }
+
+  // Mapper XML → the interface it implements. The namespace is that interface's
+  // fully-qualified name, which is the one hard link between the two files.
+  for (const [rel, entry] of Object.entries(contentLogic)) {
+    const namespace = typeof entry.package === 'string' ? entry.package : ''
+    if (namespace === '' || !rel.toLowerCase().endsWith('.xml')) continue
+    const target = byQualified.get(namespace)
+    if (target === undefined || target === rel) continue
+    entry.mapper_interface = target
+    const java = contentLogic[target]
+    if (java !== undefined) java.mapper_xml = rel
+  }
+
+  for (const entry of Object.values(contentLogic)) {
+    const imports = Array.isArray(entry.imports) ? entry.imports : []
+    const relations = Array.isArray(entry.relations) ? entry.relations : []
+    for (const relation of relations) {
+      // Entries reused from a previous build still carry the path they resolved
+      // to last time; it is dropped first so a deleted file cannot leave a
+      // pointer to itself behind.
+      delete relation.path
+      const qualified = imports.find((item) => item === relation.to || item.endsWith(`.${relation.to}`))
+      const target = qualified === undefined ? bySimple.get(relation.to) : byQualified.get(qualified)
+      if (target !== undefined) relation.path = target
+    }
+  }
+}
 
 /**
  * An index with no content, used when nothing has been built yet.
@@ -1142,6 +1869,7 @@ export async function buildProjectIndex(options) {
 
   const sortedLogic = {}
   for (const key of Object.keys(contentLogic).sort()) sortedLogic[key] = contentLogic[key]
+  buildRelations(sortedLogic)
 
   const languageTotals = new Map()
   for (const entry of directoryIndex) {
@@ -1202,6 +1930,19 @@ function score(text, needle) {
 }
 
 /**
+ * ` · 第 N 行` for a hit label, or '' when the entry predates line numbers.
+ *
+ * A hit without a line still costs a grep to act on, so every label that can
+ * carry one does.
+ *
+ * @param {number|undefined} line - 1-based line from the entry.
+ * @returns {string} the suffix.
+ */
+function atLine(line) {
+  return typeof line === 'number' ? ` · 第 ${line} 行` : ''
+}
+
+/**
  * Search the index by keyword.
  *
  * @param {object} index - a built index.
@@ -1255,7 +1996,7 @@ export function queryIndex(index, query, limit = 20) {
         hit: {
           kind: 'class',
           path,
-          label: `${path} · ${item.name}`,
+          label: `${path} · ${item.name}${atLine(item.line)}`,
           detail: truncate(
             [
               item.extends === '' ? '' : `extends ${item.extends}`,
@@ -1276,8 +2017,89 @@ export function queryIndex(index, query, limit = 20) {
           hit: {
             kind: 'method',
             path,
-            label: `${path} · ${item.name}(${(item.parameters ?? []).join(', ')})`,
+            label: `${path} · ${item.name}(${(item.parameters ?? []).join(', ')})${atLine(item.line)}`,
             detail: truncate(`${item.return_type ?? ''} · ${item.logic_summary ?? ''}`)
+          }
+        })
+      }
+    }
+
+    // An endpoint is looked up by its URL, a column by its column name, and a
+    // constant by its literal — none of which appear in a name. Matching the
+    // argument text is what makes those searches land at all.
+    for (const item of [...(entry.classes ?? []), ...(entry.methods ?? [])]) {
+      const args = item.annotation_args ?? {}
+      for (const [annotation, value] of Object.entries(args)) {
+        const itemScore = score(value, needle)
+        if (itemScore === 0) continue
+        hits.push({
+          score: itemScore,
+          hit: {
+            kind: 'annotation',
+            path,
+            label: `${path} · @${annotation}(${truncate(value, 80)})`,
+            detail: truncate(`${item.name ?? ''}${atLine(item.line)}`)
+          }
+        })
+      }
+    }
+    for (const item of entry.fields ?? []) {
+      const itemScore = Math.max(score(item.name, needle), score(item.column, needle), score(item.value, needle))
+      if (itemScore === 0) continue
+      hits.push({
+        score: itemScore,
+        hit: {
+          kind: item.value === '' ? 'field' : 'constant',
+          path,
+          label: `${path} · ${item.name}${atLine(item.line)}`,
+          detail: truncate(
+            [item.column === '' ? '' : `${item.type} · 列 ${item.column}`, item.value === '' ? item.comment : item.value]
+              .filter((part) => part !== '' && part !== undefined)
+              .join(' · ')
+          )
+        }
+      })
+    }
+    for (const item of entry.constructors ?? []) {
+      const itemScore = score(item.name, needle)
+      if (itemScore === 0) continue
+      hits.push({
+        score: Math.floor(itemScore / 2),
+        hit: {
+          kind: 'constructor',
+          path,
+          label: `${path} · ${item.name}(${(item.parameters ?? []).join(', ')})${atLine(item.line)}`,
+          detail: '构造器'
+        }
+      })
+    }
+    // Interface constants and enum constants live on their class, because they
+    // belong to it: `WipConstant.WORK_AREA_SET` is one declaration, not a
+    // free-floating field.
+    for (const item of entry.classes ?? []) {
+      for (const constant of item.constants ?? []) {
+        const itemScore = Math.max(score(constant.name, needle), score(constant.value, needle))
+        if (itemScore === 0) continue
+        hits.push({
+          score: itemScore,
+          hit: {
+            kind: 'constant',
+            path,
+            label: `${path} · ${item.name}.${constant.name}${atLine(constant.line)}`,
+            detail: truncate(`${constant.type} = ${constant.value}`, 120)
+          }
+        })
+      }
+      for (const value of item.enum_values ?? []) {
+        const itemScore = Math.max(score(value.name, needle), score(value.args, needle))
+        if (itemScore === 0) continue
+        hits.push({
+          score: itemScore,
+          hit: {
+            kind: 'constant',
+            path,
+            label: `${path} · ${item.name}.${value.name}${atLine(value.line)}`,
+            detail: truncate(value.args === '' ? '枚举常量' : `枚举常量(${value.args})`, 120)
           }
         })
       }
@@ -1290,7 +2112,7 @@ export function queryIndex(index, query, limit = 20) {
           hit: {
             kind: 'rule',
             path,
-            label: `${path} · ${item.rule_name}`,
+            label: `${path} · ${item.rule_name}${atLine(item.line)}`,
             detail: item.description ?? ''
           }
         })
@@ -1333,10 +2155,30 @@ export function readIndexEntry(index, relPath, symbol) {
   if (entry !== null && needle !== '') {
     const classHit = (entry.classes ?? []).some((item) => collapse(item.name).toLowerCase().includes(needle))
     if (!classHit) {
+      // Spread, not a fresh object: package / imports / relations / constructors
+      // describe the file, not the symbol, and dropping them here is what made
+      // a narrowed read lose the very context it was asked for.
       entry = {
-        classes: (entry.classes ?? []).filter((item) => collapse(item.name).toLowerCase().includes(needle)),
+        ...entry,
+        // A constant or enum value is named by the symbol too — `WORK_AREA_SET`
+        // is what the caller typed, and the class holding it must survive the
+        // filter even though the class name does not contain it.
+        classes: (entry.classes ?? [])
+          .map((item) => {
+            const constants = (item.constants ?? []).filter((constant) =>
+              collapse(constant.name).toLowerCase().includes(needle)
+            )
+            const enumValues = (item.enum_values ?? []).filter((value) =>
+              collapse(value.name).toLowerCase().includes(needle)
+            )
+            const nameHit = collapse(item.name).toLowerCase().includes(needle)
+            if (!nameHit && constants.length === 0 && enumValues.length === 0) return null
+            return nameHit ? item : { ...item, constants, enum_values: enumValues }
+          })
+          .filter((item) => item !== null),
         fields: (entry.fields ?? []).filter((item) => collapse(item.name).toLowerCase().includes(needle)),
         methods: (entry.methods ?? []).filter((item) => collapse(item.name).toLowerCase().includes(needle)),
+        constructors: (entry.constructors ?? []).filter((item) => collapse(item.name).toLowerCase().includes(needle)),
         logic_details: (entry.logic_details ?? []).filter(
           (item) =>
             collapse(item.rule_name).toLowerCase().includes(needle) ||
@@ -1503,6 +2345,10 @@ export function formatRead(entry, relPath) {
     return lines.join('\n')
   }
 
+  if (logic.package !== undefined && logic.package !== '') lines.push(`包：${logic.package}`)
+  if (logic.mapper_xml !== undefined) lines.push(`Mapper XML：${logic.mapper_xml}`)
+  if (logic.mapper_interface !== undefined) lines.push(`Mapper 接口：${logic.mapper_interface}`)
+
   for (const item of logic.classes ?? []) {
     const heritage = [
       item.extends === '' ? '' : `extends ${item.extends}`,
@@ -1510,20 +2356,66 @@ export function formatRead(entry, relPath) {
     ]
       .filter((part) => part !== '')
       .join(' ')
-    const annotations = (item.annotations ?? []).length > 0 ? ` @${item.annotations.join(' @')}` : ''
-    lines.push(`类 ${item.name}${heritage === '' ? '' : ` ${heritage}`}${annotations}`)
+    // The argument text is rendered inline, the way it is written in the source:
+    // `@RequestMapping("/taskArrangement")` is the fact, `@RequestMapping` is not.
+    const annotations = (item.annotations ?? [])
+      .map((name) => {
+        const value = item.annotation_args?.[name]
+        return value === undefined ? `@${name}` : `@${name}(${value})`
+      })
+      .join(' ')
+    const line = item.line === undefined ? '' : ` · 第 ${item.line} 行`
+    lines.push(`${kindLabel(item.kind)} ${item.name}${line}`)
+    if (heritage !== '' || annotations !== '') {
+      lines.push(`  ${[heritage, annotations].filter((part) => part !== '').join(' ')}`)
+    }
     if (item.summary !== '') lines.push(`  ${item.summary}`)
+    if ((item.constants ?? []).length > 0) {
+      lines.push(`  常量 ${item.constants.length} 个：`)
+      for (const constant of item.constants) {
+        const comment = constant.comment === '' ? '' : ` — ${constant.comment}`
+        lines.push(`  - ${constant.name}: ${constant.type} = ${constant.value}${comment}（第 ${constant.line} 行）`)
+      }
+    }
+    if ((item.enum_values ?? []).length > 0) {
+      lines.push(`  枚举值 ${item.enum_values.length} 个：`)
+      for (const value of item.enum_values) {
+        const args = value.args === '' ? '' : `(${value.args})`
+        lines.push(`  - ${value.name}${args}（第 ${value.line} 行）`)
+      }
+    }
   }
   if ((logic.fields ?? []).length > 0) {
     lines.push(`字段 ${logic.fields.length} 个：`)
     for (const item of logic.fields) {
-      lines.push(`- ${item.name}: ${item.type}${item.comment === '' ? '' : ` — ${item.comment}`}`)
+      const parts = []
+      if (item.column !== undefined && item.column !== '') parts.push(`列 ${item.column}`)
+      if (item.value !== undefined && item.value !== '') parts.push(`= ${item.value}`)
+      if (item.comment !== '' && item.comment !== undefined) parts.push(item.comment)
+      const tail = parts.length === 0 ? '' : ` — ${parts.join(' · ')}`
+      const line = item.line === undefined ? '' : `（第 ${item.line} 行）`
+      lines.push(`- ${item.name}: ${item.type}${line}${tail}`)
+    }
+  }
+  if ((logic.constructors ?? []).length > 0) {
+    lines.push(`构造器 ${logic.constructors.length} 个：`)
+    for (const item of logic.constructors) {
+      const line = item.line === undefined ? '' : `（第 ${item.line} 行）`
+      lines.push(`- ${item.name}(${(item.parameters ?? []).join(', ')})${line}`)
     }
   }
   if ((logic.methods ?? []).length > 0) {
     lines.push(`方法 ${logic.methods.length} 个：`)
     for (const item of logic.methods) {
-      lines.push(`- ${item.name}(${(item.parameters ?? []).join(', ')}) → ${item.return_type}`)
+      const annotations = (item.annotations ?? [])
+        .map((name) => {
+          const value = item.annotation_args?.[name]
+          return value === undefined ? `@${name}` : `@${name}(${value})`
+        })
+        .join(' ')
+      const line = item.line === undefined ? '' : ` · 第 ${item.line} 行`
+      lines.push(`- ${item.name}(${(item.parameters ?? []).join(', ')}) → ${item.return_type}${line}`)
+      if (annotations !== '') lines.push(`  ${annotations}`)
       if (item.logic_summary !== '') lines.push(`  ${item.logic_summary}`)
       if ((item.key_dependencies ?? []).length > 0) {
         lines.push(`  依赖：${item.key_dependencies.join('、')}`)
@@ -1532,9 +2424,32 @@ export function formatRead(entry, relPath) {
   }
   if ((logic.logic_details ?? []).length > 0) {
     lines.push(`业务规则 ${logic.logic_details.length} 条：`)
-    for (const item of logic.logic_details) lines.push(`- ${item.rule_name}：${item.description}`)
+    for (const item of logic.logic_details) {
+      const line = item.line === undefined ? '' : `（第 ${item.line} 行）`
+      const result = item.result_type === undefined || item.result_type === '' ? '' : ` → ${item.result_type}`
+      lines.push(`- ${item.rule_name}${result}${line}：${item.description}`)
+    }
+  }
+  if ((logic.relations ?? []).length > 0) {
+    lines.push(`引用 ${logic.relations.length} 条（本项目内可定位的标了路径）：`)
+    for (const relation of logic.relations) {
+      const target = relation.path === undefined ? '' : ` → ${relation.path}`
+      lines.push(`- ${relation.kind} ${relation.to}${target}`)
+    }
+  }
+  if ((logic.imports ?? []).length > 0) {
+    lines.push(`import ${logic.imports.length} 条：${logic.imports.join('、')}`)
   }
   return lines.join('\n')
+}
+
+/** Chinese label for a class-like declaration kind. */
+function kindLabel(kind) {
+  if (kind === 'interface') return '接口'
+  if (kind === 'enum') return '枚举'
+  if (kind === 'record') return '记录'
+  if (kind === 'mapper') return 'Mapper'
+  return '类'
 }
 
 /**
@@ -1827,8 +2742,9 @@ const TOOL_DESCRIPTION =
   '信任规则按 hash 判断，不按时间判断：action=verify 比对索引里的 hash 与磁盘现状——' +
   'hash 一致说明索引描述的就是当前这份文件，可以直接用它的类/字段/方法/规则回答，也可以直接基于它改源码，不必先全量读一遍；' +
   'hash 不一致说明这一条已过期，改源码前必须自己读该文件。' +
-  'action=status 先看索引是否就绪；action=query 按关键词（文件路径/类名/方法名/业务规则）检索；' +
-  'action=read 读某个文件的结构化条目（类、字段、方法、业务规则），可用 symbol 收窄到单个类或方法；' +
+  'action=status 先看索引是否就绪；action=query 按关键词（文件路径/类名/方法名/业务规则/接口 URL/表列名/常量值）检索；' +
+  'action=read 读某个文件的结构化条目（类、字段、方法、构造器、常量与枚举值、注解参数、行号、引用关系、业务规则），' +
+  '可用 symbol 收窄到单个类或方法；' +
   'action=verify 校验某个文件的条目是否仍然可信（改源码之前做这一步）；action=build 强制全量重建（通常不必手动调用）。' +
   '本工具不会等待构建完成：索引缺失时它直接说明现状，此时改用 grep/glob/read 回答当前问题，' +
   '并告诉用户「已触发后台索引构建，当前我先基于原生检索为您解答」。'
