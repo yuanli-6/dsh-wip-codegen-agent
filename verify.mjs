@@ -13,7 +13,7 @@
  *
  * Run: node verify.mjs
  */
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -47,6 +47,27 @@ const warnIf = (label, fn) => {
   } catch (error) {
     warnings.push(label)
     console.log(`  warn ${label} -> ${error.message}`)
+  }
+}
+
+/**
+ * Same as `check`, for a body that has to await.
+ *
+ * `check` calls its function without awaiting it, so an async body that throws
+ * fails *after* the line already printed `ok` — and surfaces as an unhandled
+ * rejection that takes the whole run down instead of one named check. Anything
+ * that touches the filesystem goes through here.
+ *
+ * @param {string} label - what is being checked.
+ * @param {() => Promise<void>} fn - rejects with a reason when the check fails.
+ */
+const checkAsync = async (label, fn) => {
+  try {
+    await fn()
+    console.log(`  ok   ${label}`)
+  } catch (error) {
+    failures.push(label)
+    console.log(`  FAIL ${label} -> ${error.message}`)
   }
 }
 
@@ -130,7 +151,11 @@ check('spec makes the project index the default way in (§十七)', () => {
   // description is only read when the model is already considering the tool.
   for (const needle of [
     '## 十七、项目索引优先（本预设的默认工作方式）',
-    '.dsh/index/project_index.json',
+    '.dsh/index/',
+    'master_index.json',
+    'shards/',
+    'logic_rules.json',
+    'agent_rules.json',
     'project_meta',
     'directory_index',
     'content_logic_index',
@@ -142,12 +167,34 @@ check('spec makes the project index the default way in (§十七)', () => {
   ]) {
     assert(rawSpec.includes(needle), `§十七 no longer mentions "${needle}"`)
   }
+  // The multi-file layout is the whole point of §十七.1: a single 10 MB JSON is
+  // a trap, and the spec has to name the split, the per-shard ceiling and the
+  // legacy file that gets deleted on sight — otherwise the model goes looking
+  // for a file that no longer exists.
+  for (const needle of [
+    '800 KB',
+    'project_index.json',
+    '直接删除并按新结构重建'
+  ]) {
+    assert(rawSpec.includes(needle), `§十七 no longer explains the split ("${needle}")`)
+  }
+  // Three steps, and the ceiling on step three. "Read the file" is what the
+  // split exists to prevent, so the spec has to forbid the whole-file read and
+  // name a line budget.
+  for (const needle of ['### 17.2 三步走', '行号', 'line+50', '300 行']) {
+    assert(rawSpec.includes(needle), `§十七 lost the three-step / line-budget rule ("${needle}")`)
+  }
+  // Terminal output is the other way a context window dies.
+  assert(
+    rawSpec.includes('### 17.5 终端命令防爆内存') && rawSpec.includes('Select-Object -First 50'),
+    '§十七 no longer caps terminal output'
+  )
   // Trust is decided by content hash, never by the age of the index. A lease
   // cannot distinguish a fresh entry from a stale one — an index built one
   // second ago can still describe an older file. Pinning the wording here keeps
   // the spec from drifting back to "built within 30 minutes means trustworthy".
   assert(
-    rawSpec.includes('### 17.2 可信度看 hash，不看时间'),
+    rawSpec.includes('### 17.3 可信度看 hash，不看时间'),
     '§十七 lost the section that makes hash the trust criterion'
   )
   assert(
@@ -517,11 +564,22 @@ check('the index module exports the pure engine pieces', () => {
   }
 })
 check('the index module exports the index format constants', () => {
-  assert(indexModule.INDEX_VERSION >= 1, `INDEX_VERSION = ${indexModule.INDEX_VERSION}`)
+  assert(indexModule.INDEX_VERSION >= 4, `INDEX_VERSION = ${indexModule.INDEX_VERSION}`)
   assert(typeof indexModule.INDEX_RELATIVE_PATH === 'string', 'INDEX_RELATIVE_PATH is not a string')
+  // The entry point moved from one 10 MB file to a master + shards directory.
+  // The path is asserted because the spec and the tool description both name it,
+  // and a silent rename would send the model looking for a file nobody writes.
   assert(
-    indexModule.INDEX_RELATIVE_PATH.replace(/\\/g, '/') === '.dsh/index/project_index.json',
+    indexModule.INDEX_RELATIVE_PATH.replace(/\\/g, '/') === '.dsh/index/master_index.json',
     `INDEX_RELATIVE_PATH = ${indexModule.INDEX_RELATIVE_PATH} — the spec fixes this path`
+  )
+  assert(
+    indexModule.LEGACY_INDEX_FILE === 'project_index.json',
+    `LEGACY_INDEX_FILE = ${indexModule.LEGACY_INDEX_FILE} — the pre-split file must be recognised and deleted`
+  )
+  assert(
+    indexModule.SHARD_MAX_BYTES > 0 && indexModule.SHARD_MAX_BYTES <= 1024 * 1024,
+    `SHARD_MAX_BYTES = ${indexModule.SHARD_MAX_BYTES} — a shard above 1 MB defeats the split`
   )
   assert(
     indexModule.LEASE_MS === 30 * 60 * 1000,
@@ -1054,7 +1112,9 @@ check('the tool definition is well-formed', () => {
 check('the tool description carries the contract the model needs', () => {
   const tool = indexModule.createProjectIndexTool({ resolve: async () => ({ root: '.', service: {} }) })
   for (const needle of [
-    '.dsh/index/project_index.json',
+    '.dsh/index/',
+    'master_index.json',
+    'shards/',
     'action=query',
     'action=read',
     'action=verify',
@@ -1073,7 +1133,7 @@ check('the tool description carries the contract the model needs', () => {
     'the tool description has drifted back to a time-based freshness rule'
   )
 })
-check('every indexed file carries its sha256 in the index itself', async () => {
+await checkAsync('every indexed file carries its sha256 in the index itself', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-hash-'))
   try {
     mkdirSync(join(root, 'src'), { recursive: true })
@@ -1091,7 +1151,7 @@ check('every indexed file carries its sha256 in the index itself', async () => {
     rmSync(root, { recursive: true, force: true })
   }
 })
-check('verify reports agreement, disagreement and absence', async () => {
+await checkAsync('verify reports agreement, disagreement and absence', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-verify-'))
   try {
     mkdirSync(join(root, 'src'), { recursive: true })
@@ -1124,6 +1184,174 @@ check('verify reports agreement, disagreement and absence', async () => {
     assert(missing === null, 'an unindexed path produced a comparison')
     const missingText = indexModule.formatVerify(missing, 'src/Nope.java')
     assert(missingText.includes('索引里没有'), `missing text is "${missingText}"`)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+check('a file lands in the shard its business area names', () => {
+  for (const [path, expected] of [
+    ['wip-service/src/main/java/com/dq/wip/domain/entity/WipOrder.java', 'entity'],
+    ['wip-service/src/main/java/com/dq/wip/service/impl/WipOrderServiceImpl.java', 'service_impl'],
+    ['wip-service/src/main/java/com/dq/wip/service/WipOrderService.java', 'service'],
+    ['wip-service/src/main/java/com/dq/wip/controller/WipOrderController.java', 'controller'],
+    ['wip-service/src/main/java/com/dq/wip/mapper/WipOrderMapper.java', 'mapper'],
+    ['wip-service/src/main/resources/mapper/WipOrderMapper.xml', 'mapper'],
+    ['wip-service/src/main/java/com/dq/wip/domain/vo/req/WipOrderReq.java', 'req'],
+    ['wip-service/src/main/java/com/dq/wip/domain/vo/rep/WipOrderResp.java', 'rep'],
+    ['wip-service/src/main/java/com/dq/wip/domain/vo/WipOrderVo.java', 'vo'],
+    ['wip-service/src/main/java/com/dq/wip/domain/dto/UserDTO.java', 'dto'],
+    ['docs/index.md', 'other']
+  ]) {
+    const actual = indexModule.shardOf(path)
+    assert(actual === expected, `shardOf("${path}") = "${actual}", expected "${expected}"`)
+  }
+  // `service/impl/` must win over `service/`, and `vo/req/` over `vo/`: the
+  // regexes are ordered, and a reordering would silently merge the shards.
+  assert(indexModule.shardOf('a/service/impl/B.java') === 'service_impl', 'service_impl lost to service')
+  assert(indexModule.shardOf('a/domain/vo/req/B.java') === 'req', 'req lost to vo')
+})
+await checkAsync('the split honours the shard ceiling and round-trips', async () => {
+  // A single index for a mid-sized Java project passes 10 MB. The whole point of
+  // the split is that no artefact ever gets that large, so the ceiling is
+  // asserted against a synthetic project wide enough to need several shards.
+  const root = mkdtempSync(join(tmpdir(), 'pi-shard-'))
+  try {
+    const areas = [
+      'domain/entity',
+      'service/impl',
+      'service',
+      'controller',
+      'mapper',
+      'domain/vo/req',
+      'domain/vo/rep',
+      'domain/vo'
+    ]
+    for (const area of areas) {
+      const dir = join(root, 'src', 'main', 'java', 'demo', ...area.split('/'))
+      mkdirSync(dir, { recursive: true })
+      for (let index = 0; index < 6; index += 1) {
+        const body = [
+          'package demo;',
+          '',
+          `/** 第 ${index} 个。 */`,
+          `public class Bean${index} {`,
+          `    /** 计数 ${index} */`,
+          `    private int count${index};`,
+          '',
+          `    public int get${index}() {`,
+          `        if (count${index} > 0) {`,
+          `            return count${index};`,
+          '        }',
+          '        return 0;',
+          '    }',
+          '}',
+          ''
+        ].join('\n')
+        writeFileSync(join(dir, `Bean${index}.java`), body, 'utf8')
+      }
+    }
+    const built = await indexModule.buildProjectIndex({ root, now: Date.now() + 10_000 })
+    const layout = indexModule.buildShards(built.index, 4096)
+    assert(layout.shards.length > 1, `a 4096-byte ceiling produced ${layout.shards.length} shard(s)`)
+    for (const shard of layout.shards) {
+      const bytes = Buffer.byteLength(JSON.stringify(shard.payload), 'utf8')
+      assert(bytes <= 4096, `shard "${shard.file}" is ${bytes} bytes, over the 4096-byte ceiling`)
+    }
+    // The master carries the shape, not the file entries: it must stay small
+    // enough to read whole no matter how many shards exist.
+    const masterBytes = Buffer.byteLength(JSON.stringify(layout.master), 'utf8')
+    assert(masterBytes < 8192, `master is ${masterBytes} bytes, too large to read whole`)
+    assert(
+      Array.isArray(layout.master.shards) && layout.master.shards.length === layout.shards.length,
+      'the master does not list every shard'
+    )
+    for (const entry of layout.master.directory_index) {
+      assert(
+        entry.children === undefined,
+        `the master carries a file list for "${entry.path}" — file entries belong in the shards`
+      )
+    }
+
+    // Round-trip: writing then loading must reproduce the entries, or `read`
+    // and `verify` answer from a different index than the one that was built.
+    const paths = indexModule.indexPaths(root)
+    const written = await indexModule.writeIndexFiles(paths, built.index)
+    assert(written.shards === layout.shards.length, `wrote ${written.shards}, expected ${layout.shards.length}`)
+    const loaded = await indexModule.loadIndexFiles(paths)
+    assert(loaded !== null, 'the written layout did not load back')
+    const before = Object.keys(built.index.content_logic_index).sort()
+    const after = Object.keys(loaded.content_logic_index).sort()
+    assert(
+      before.length === after.length && before.every((key, index) => key === after[index]),
+      `round-trip changed the file set: ${before.length} in, ${after.length} out`
+    )
+    const sample = before[0]
+    // The shards drop structurally empty containers (`imports: []`, `{}`), so a
+    // round-trip is equal in meaning, not byte-for-byte. Normalise both sides the
+    // same way before comparing.
+    const normalize = (value) => {
+      if (Array.isArray(value)) {
+        const kept = value.map(normalize).filter((item) => item !== undefined)
+        return kept.length === 0 ? undefined : kept
+      }
+      if (value !== null && typeof value === 'object') {
+        const kept = {}
+        for (const key of Object.keys(value).sort()) {
+          const inner = normalize(value[key])
+          if (inner !== undefined) kept[key] = inner
+        }
+        return Object.keys(kept).length === 0 ? undefined : kept
+      }
+      return value
+    }
+    assert(
+      JSON.stringify(normalize(loaded.content_logic_index[sample])) ===
+        JSON.stringify(normalize(built.index.content_logic_index[sample])),
+      `round-trip changed the entry for "${sample}"`
+    )
+    // Freshness evidence lives in the shards' `meta`, so it has to survive too.
+    const children = loaded.directory_index.flatMap((entry) => entry.children ?? [])
+    assert(children.length === before.length, `round-trip lost file children (${children.length}/${before.length})`)
+    for (const child of children) {
+      assert(
+        typeof child.hash === 'string' && /^[0-9a-f]{64}$/.test(child.hash),
+        `"${child.path}" lost its sha256 in the round-trip`
+      )
+      assert(typeof child.language === 'string', `"${child.path}" lost its language in the round-trip`)
+    }
+    // Rules were split out of the shards; they must come back attached.
+    const withRules = Object.entries(built.index.content_logic_index).filter(
+      ([, entry]) => (entry.logic_details ?? []).length > 0
+    )
+    if (withRules.length > 0) {
+      const [rel, entry] = withRules[0]
+      assert(
+        (loaded.content_logic_index[rel]?.logic_details ?? []).length === entry.logic_details.length,
+        `"${rel}" lost its business rules in the round-trip`
+      )
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+await checkAsync('a stale single-file index is deleted, not left beside the shards', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-legacy-'))
+  try {
+    mkdirSync(join(root, 'src'), { recursive: true })
+    writeFileSync(join(root, 'src', 'Alpha.java'), 'public class Alpha {\n    int count;\n}\n', 'utf8')
+    const paths = indexModule.indexPaths(root)
+    mkdirSync(paths.dir, { recursive: true })
+    writeFileSync(paths.legacy, '{"project_meta":{}}\n', 'utf8')
+    assert(existsSync(paths.legacy), 'the legacy file was not created')
+
+    const built = await indexModule.buildProjectIndex({ root, now: Date.now() + 10_000 })
+    await indexModule.writeIndexFiles(paths, built.index)
+    assert(existsSync(paths.master), 'the master file was not written')
+    assert(existsSync(paths.shards), 'the shards directory was not created')
+
+    // The service is what deletes the legacy file; assert the constant the
+    // deletion keys off, so a rename cannot quietly leave 10 MB of dead weight.
+    assert(paths.legacy.endsWith(indexModule.LEGACY_INDEX_FILE), 'indexPaths().legacy does not end with LEGACY_INDEX_FILE')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

@@ -1,6 +1,13 @@
 /**
- * Composite project index: the `.dsh/index/project_index.json` that §十七 of the
- * spec tells the Agent to trust before it reads any source file.
+ * Composite project index: the `.dsh/index/` directory that §十七 of the spec
+ * tells the Agent to trust before it reads any source file.
+ *
+ * One 10 MB JSON file is not an index, it is a trap: a mid-sized Java project
+ * blows past the context window the moment anyone opens it. The artefacts are
+ * therefore split by business area — `master_index.json` holds the shape,
+ * `shards/*.json` hold the per-file entries (800 KB ceiling each),
+ * `logic_rules.json` holds every business rule, and `agent_rules.json` holds the
+ * Agent's own rules sliced per heading. Reading is a lookup, not a download.
  *
  * Three pieces live here.
  *
@@ -32,9 +39,10 @@
  */
 
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, watch } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, watch } from 'node:fs'
 import { readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /** Cordis plugin name; also the patch row id. */
 export const name = 'wip-codegen-project-index'
@@ -62,18 +70,50 @@ export const inject = ['tools']
 /** Directory (relative to the project root) that holds every generated artefact. */
 export const INDEX_DIR = '.dsh/index'
 
-/** The index itself. Path fixed by the spec. */
-export const INDEX_FILE = 'project_index.json'
+/**
+ * Entry point of the index: project meta, the macro directory tree and the
+ * shard manifest. Stays small (tens of KB) so reading it whole is always cheap.
+ */
+export const INDEX_FILE = 'master_index.json'
 
-/** The index path as the spec writes it, relative to the project root. */
+/** The master file's path, relative to the project root. */
 export const INDEX_RELATIVE_PATH = `${INDEX_DIR}/${INDEX_FILE}`
 
+/** Subdirectory holding one file per shard. */
+export const SHARDS_DIR = 'shards'
+
 /**
- * Sidecar holding per-file hashes.
+ * Ceiling for a single shard file.
  *
- * Deliberately *not* inside `project_index.json`: the spec pins that file's
- * three top-level keys, and a per-file hash table is bookkeeping, not project
- * knowledge. Keeping it separate also means the index stays diff-friendly.
+ * The spec says 1 MB; 800 KB leaves headroom for the few hundred methods a
+ * project gains before the next rebuild would otherwise have to re-split.
+ * A shard above the ceiling is split by path prefix, and — when one directory
+ * cannot be split any further — by size.
+ */
+export const SHARD_MAX_BYTES = 800 * 1024
+
+/**
+ * The single-file index written by v2/v3. Detected and deleted on sight: it is
+ * the 10 MB artefact this multi-file layout exists to replace.
+ */
+export const LEGACY_INDEX_FILE = 'project_index.json'
+
+/**
+ * Every file's `logic_details`, keyed by file path.
+ *
+ * Split out of the shards because "哪条业务规则在哪个文件里" is a question the
+ * model asks on its own, without wanting any class or method around it.
+ */
+export const RULES_FILE = 'logic_rules.json'
+
+/** `agent_rules_index`: the Agent's own rules, sliced per heading. */
+export const AGENT_RULES_FILE = 'agent_rules.json'
+
+/**
+ * Sidecar holding per-file size/mtime/hash, used to decide what to re-parse.
+ *
+ * Deliberately *not* inside the index: it is bookkeeping, not project knowledge,
+ * and keeping it separate means a rebuild that changes nothing produces no diff.
  */
 export const CACHE_FILE = 'file-cache.json'
 
@@ -82,8 +122,15 @@ export const CACHE_FILE = 'file-cache.json'
  *
  * 2: annotation argument values, line numbers, imports, interface constants,
  *    enum values, constructors and cross-file relations joined the entry.
+ * 3: the fourth block `agent_rules_index` — the Agent's own rules (spec body,
+ *    AGENTS.md, plugin config, project docs) indexed with per-heading slices,
+ *    so "规范里怎么写导出" is a query instead of a 45 KB file read.
+ * 4: the single 10 MB file became a directory — `master_index.json` (meta +
+ *    directory tree + shard manifest), `shards/*.json` (the per-file entries,
+ *    split by business area and capped at SHARD_MAX_BYTES), plus
+ *    `agent_rules.json` and `logic_rules.json`.
  */
-export const INDEX_VERSION = 2
+export const INDEX_VERSION = 4
 
 /** Listener lease. The spec's "有效期 30 分钟". */
 export const LEASE_MS = 30 * 60 * 1000
@@ -182,6 +229,14 @@ const SUMMARY_MAX = 200
 const LOGIC_MAX = 160
 /** Constants carry the literal itself, so they get a longer leash than prose. */
 const VALUE_MAX = 300
+/** Per-section cap for `agent_rules_index`: a section is a slice, not a file. */
+const RULE_SECTION_MAX = 400
+/** Ceiling on sections per rules file, so one huge document cannot dominate. */
+const MAX_RULE_SECTIONS = 120
+/** Keywords per section, after de-duplication. */
+const MAX_SECTION_KEYWORDS = 12
+/** The only headings that start a section: `#`, `##`, `###`. */
+const SECTION_RE = /^#{1,3}\s/
 
 // ---------------------------------------------------------------------------
 // paths
@@ -224,14 +279,22 @@ export function findProjectRoot(start) {
 }
 
 /**
- * Absolute paths of the three artefacts.
+ * Absolute paths of every artefact.
  *
  * @param {string} root - project root.
- * @returns {{dir: string, index: string, cache: string}} absolute paths.
+ * @returns {{dir: string, master: string, shards: string, agentRules: string, logicRules: string, legacy: string, cache: string}} absolute paths.
  */
 export function indexPaths(root) {
   const dir = join(root, ...INDEX_DIR.split('/'))
-  return { dir, index: join(dir, INDEX_FILE), cache: join(dir, CACHE_FILE) }
+  return {
+    dir,
+    master: join(dir, INDEX_FILE),
+    shards: join(dir, SHARDS_DIR),
+    agentRules: join(dir, AGENT_RULES_FILE),
+    logicRules: join(dir, RULES_FILE),
+    legacy: join(dir, LEGACY_INDEX_FILE),
+    cache: join(dir, CACHE_FILE)
+  }
 }
 
 /**
@@ -1655,6 +1718,356 @@ export function summarizeDirectory(relDir, children) {
 }
 
 // ---------------------------------------------------------------------------
+// agent rules (the fourth block)
+// ---------------------------------------------------------------------------
+//
+// The spec body, the AGENTS.md files and this plugin's own config are *rules*,
+// and v2 of the index knew nothing about them: the model had to guess where the
+// spec lived and re-read tens of KB of Markdown to answer "what does §十四 say
+// about deleting a file". They are indexed here instead, split by heading, so a
+// keyword query lands on the section that answers it.
+
+/** This module's own directory, i.e. the plugin's install directory. */
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
+
+/**
+ * Absolute path of the spec body.
+ *
+ * Deliberately a path join rather than `specPath()` from `./index.js`: that
+ * module imports this one, so importing it back would close a cycle. The
+ * relative location is fixed by the package layout, and `verify.mjs` already
+ * asserts `assets/wip-codegen/system-prompt.md` is present, so the join is safe.
+ */
+const SPEC_ABSOLUTE = join(PLUGIN_DIR, 'assets', 'wip-codegen', 'system-prompt.md')
+
+/** This plugin's own configuration, indexed as `plugin-config`. */
+const PLUGIN_CONFIG_FILES = ['package.json', 'cordis.patch.yml', 'persona-hot.js']
+
+/**
+ * Whether `absolute` sits under `root`.
+ *
+ * Compared case-insensitively on purpose: the path arrives from the working
+ * directory service on Windows, where `C:\Foo` and `c:\foo` are one directory.
+ *
+ * @param {string} root - project root.
+ * @param {string} absolute - candidate absolute path.
+ * @returns {boolean} true when the path is inside the project.
+ */
+function isInsideRoot(root, absolute) {
+  const base = toPosix(root).toLowerCase()
+  const target = toPosix(absolute).toLowerCase()
+  return target === base || target.startsWith(`${base}/`)
+}
+
+/**
+ * The `§`-prefixed form of a chapter heading.
+ *
+ * The spec writes its chapters as `## 十四、强制交互流程：先确认，再落地`, while
+ * every reference to one — and the model's own queries — says `§十四`. Storing
+ * the `§` form is what makes `queryIndex(index, '§十四')` land at all.
+ *
+ * @param {string} title - heading text, `#` marks already stripped.
+ * @returns {string} e.g. `§十四 强制交互流程：先确认，再落地`.
+ */
+function sectionTitle(title) {
+  const matched = /^([一二三四五六七八九十百]+)、\s*(.*)$/.exec(title)
+  if (matched === null) return title
+  return `§${matched[1]} ${matched[2]}`.trim()
+}
+
+/**
+ * The words worth matching a section by.
+ *
+ * Chinese runs and camelCase / UPPER_CASE identifiers only: those are what a
+ * query is actually typed as (`导出`, `askUserQuestion`, `INDEX_VERSION`).
+ * Chinese gets the first eight slots, so a section full of prose still reports
+ * the identifiers it mentions.
+ *
+ * @param {string} text - section title plus body.
+ * @returns {string[]} at most `MAX_SECTION_KEYWORDS` unique words.
+ */
+function sectionKeywords(text) {
+  const flat = collapse(text)
+  /** @type {string[]} */
+  const words = []
+  const seen = new Set()
+  /** @param {string} word @returns {boolean} whether it was kept */
+  const add = (word) => {
+    if (word.length < 2 || seen.has(word) || words.length >= MAX_SECTION_KEYWORDS) return false
+    seen.add(word)
+    words.push(word)
+    return true
+  }
+  let chinese = 0
+  for (const matched of flat.matchAll(/[\u4e00-\u9fa5]{2,}/g)) {
+    if (chinese >= 8) break
+    if (add(matched[0])) chinese += 1
+  }
+  for (const matched of flat.matchAll(/[A-Za-z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*)+/g)) add(matched[0])
+  for (const matched of flat.matchAll(/\b[A-Z][A-Z0-9_]{2,}\b/g)) add(matched[0])
+  return words
+}
+
+/**
+ * Split Markdown into heading-delimited sections.
+ *
+ * Only `#`, `##` and `###` start a section: `####` is a detail *inside* one, and
+ * splitting on it would shred the spec's tables into fragments. Text before the
+ * first heading is dropped — it is a preamble, not a rule.
+ *
+ * @param {string} source - Markdown text.
+ * @returns {{title: string, line: number, text: string, keywords: string[]}[]} sections.
+ */
+function splitMarkdownSections(source) {
+  const lines = String(source ?? '').replace(/^\uFEFF/, '').split('\n')
+  /** @type {{title: string, line: number, body: string[]}[]} */
+  const raw = []
+  /** @type {{title: string, line: number, body: string[]} | null} */
+  let current = null
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (SECTION_RE.test(line)) {
+      current = { title: sectionTitle(line.replace(/^#{1,3}\s+/, '').trim()), line: index + 1, body: [] }
+      raw.push(current)
+      continue
+    }
+    if (current !== null) current.body.push(line)
+  }
+  return raw.slice(0, MAX_RULE_SECTIONS).map((item) => {
+    const text = truncate(item.body.join('\n'), RULE_SECTION_MAX)
+    return { title: item.title, line: item.line, text, keywords: sectionKeywords(`${item.title} ${text}`) }
+  })
+}
+
+/**
+ * One-line summary for a rules file.
+ *
+ * Markdown is summarised by its first non-blank line with the `#` marks
+ * stripped — `# DSH 创造模式 Agent 提示词…` is the title, not a comment — and
+ * `package.json` by its own `name` + `description`, because its first line is
+ * `{` and says nothing. Everything else falls back to `summarizeFile`, which
+ * already understands leading comment blocks.
+ *
+ * @param {string} source - file text.
+ * @param {string} relPath - path used for the language guess.
+ * @returns {string} at most `SUMMARY_MAX` characters.
+ */
+function ruleSummary(source, relPath) {
+  const text = source.replace(/^\uFEFF/, '')
+  const language = languageOf(relPath)
+  if (language === 'JSON') {
+    try {
+      const parsed = JSON.parse(text)
+      const parts = [
+        typeof parsed?.name === 'string' ? parsed.name : '',
+        typeof parsed?.description === 'string' ? truncate(parsed.description, 160) : ''
+      ].filter((part) => part !== '')
+      if (parts.length > 0) return truncate(parts.join('：'))
+    } catch {
+      /* not JSON after all — fall through to the first line */
+    }
+  }
+  if (language === 'Markdown') {
+    const first = text
+      .split('\n')
+      .map((line) => line.trim())
+      .find((line) => line !== '')
+    if (first !== undefined) return truncate(first.replace(/^#{1,6}\s*/, ''))
+  }
+  return summarizeFile(source, relPath)
+}
+
+/**
+ * Markdown files under one directory, as paths relative to the project root.
+ *
+ * @param {string} directory - directory to walk.
+ * @param {string} prefix - its path relative to the project root.
+ * @param {string[]} out - collector, appended to.
+ * @returns {Promise<void>} resolves when the walk is done.
+ */
+async function collectMarkdown(directory, prefix, out) {
+  let entries
+  try {
+    entries = await readdir(directory, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    if (isSkippedSegment(entry.name)) continue
+    const rel = `${prefix}/${entry.name}`
+    if (entry.isDirectory()) {
+      await collectMarkdown(join(directory, entry.name), rel, out)
+      continue
+    }
+    if (entry.isFile() && /\.md$/i.test(entry.name)) out.push(rel)
+  }
+}
+
+/**
+ * Every file the rules block covers.
+ *
+ * In order: the spec body, this plugin's config, the global `AGENTS.md`
+ * (whichever of `DSH_HOME` / `DSH_AGENTS_HOME` exists), the `AGENTS.md` of each
+ * directory from the project root up to the `.git` root, and the project's own
+ * Markdown (`docs/**` plus the root's `*.md`).
+ *
+ * A missing file is skipped, never an error: a project without `AGENTS.md` and a
+ * machine without `DSH_HOME` are both normal. The walk is separate from
+ * `walkSourceFiles` on purpose — that one skips every dot-segment (`.dsh`) and
+ * knows nothing about files outside the project, and both are exactly what this
+ * block needs.
+ *
+ * @param {string} root - project root.
+ * @returns {Promise<{key: string, absolute: string, kind: string, path: string, external: boolean}[]>} candidates.
+ */
+async function collectAgentRuleFiles(root) {
+  /** @type {{key: string, absolute: string, kind: string, path: string, external: boolean}[]} */
+  const files = []
+  const seen = new Set()
+  const base = toPosix(root)
+
+  /**
+   * @param {string} absolute - file on disk.
+   * @param {string} kind - `spec` / `global-agents` / `project-agents` / `plugin-config` / `doc`.
+   * @returns {void}
+   */
+  const add = (absolute, kind) => {
+    if (typeof absolute !== 'string' || absolute === '' || !existsSync(absolute)) return
+    const posix = toPosix(absolute)
+    const external = !isInsideRoot(root, absolute)
+    // External entries are keyed by their absolute path behind an `external:`
+    // prefix: `AGENTS.md` exists both globally and per project, and a bare
+    // relative key would make the two collide in `file-cache.json`.
+    const path = external ? posix : posix.slice(base.length + 1)
+    const key = external ? `external:${posix}` : path
+    if (seen.has(key)) return
+    seen.add(key)
+    files.push({ key, absolute, kind, path, external })
+  }
+
+  add(SPEC_ABSOLUTE, 'spec')
+  for (const name of PLUGIN_CONFIG_FILES) add(join(PLUGIN_DIR, name), 'plugin-config')
+
+  for (const variable of ['DSH_HOME', 'DSH_AGENTS_HOME']) {
+    const home = process.env[variable]
+    if (typeof home === 'string' && home !== '') add(join(home, 'AGENTS.md'), 'global-agents')
+  }
+
+  // The project's own AGENTS.md, from the working root up to the repository
+  // root. Today only the global one exists; the loop is what makes a future
+  // per-repository file show up without touching this function again.
+  const repositoryRoot = toPosix(findProjectRoot(root)).toLowerCase()
+  let directory = root
+  for (let depth = 0; depth < 64; depth += 1) {
+    add(join(directory, 'AGENTS.md'), 'project-agents')
+    if (toPosix(directory).toLowerCase() === repositoryRoot) break
+    const parent = dirname(directory)
+    if (parent === directory) break
+    directory = parent
+  }
+
+  /** @type {string[]} */
+  const markdown = []
+  await collectMarkdown(join(root, 'docs'), 'docs', markdown)
+  for (const rel of markdown) add(join(root, ...rel.split('/')), 'doc')
+
+  try {
+    const top = await readdir(root, { withFileTypes: true })
+    for (const entry of top) {
+      if (!entry.isFile() || !/\.md$/i.test(entry.name)) continue
+      add(join(root, entry.name), 'doc')
+    }
+  } catch {
+    /* an unreadable root is not a build failure */
+  }
+  return files
+}
+
+/**
+ * Find a rules entry by path, exact or as a suffix, optionally narrowed to the
+ * sections matching one word.
+ *
+ * @param {object} index - a built index.
+ * @param {string} wanted - path as the caller typed it.
+ * @param {string} [symbol] - section title, or a word appearing in one.
+ * @returns {object|null} the entry, or null when no rules file matches.
+ */
+function readRuleEntry(index, wanted, symbol) {
+  const rules = index.agent_rules_index ?? {}
+  const keys = Object.keys(rules)
+  const pathOf = (key) => toPosix(rules[key]?.path ?? '')
+  const key =
+    keys.find((candidate) => candidate === wanted) ??
+    keys.find((candidate) => pathOf(candidate) === wanted) ??
+    keys.find((candidate) => candidate.endsWith(`/${wanted}`) || pathOf(candidate).endsWith(`/${wanted}`)) ??
+    keys.find((candidate) => pathOf(candidate).endsWith(wanted)) ??
+    null
+  if (key === null) return null
+  const entry = rules[key]
+  const needle = collapse(symbol ?? '').toLowerCase()
+  if (needle === '') return entry
+  const sections = (entry.sections ?? []).filter(
+    (section) =>
+      collapse(section.title).toLowerCase().includes(needle) ||
+      collapse(section.text).toLowerCase().includes(needle) ||
+      (section.keywords ?? []).some((word) => collapse(word).toLowerCase().includes(needle))
+  )
+  // A symbol that matches no section returns the whole file: an empty answer
+  // reads as "this file says nothing about it", which is the worse lie.
+  if (sections.length === 0) return entry
+  return { ...entry, sections }
+}
+
+/** Chinese label for an `agent_rules_index` kind. */
+function ruleKindLabel(kind) {
+  if (kind === 'spec') return '规范正文'
+  if (kind === 'global-agents') return '全局约定'
+  if (kind === 'project-agents') return '项目约定'
+  if (kind === 'plugin-config') return '插件配置'
+  if (kind === 'doc') return '文档'
+  return '规范'
+}
+
+/**
+ * Render a rules entry's sections, for `formatRead`.
+ *
+ * @param {object} rule - an `agent_rules_index` entry.
+ * @returns {string[]} lines, without the file header.
+ */
+function ruleSectionLines(rule) {
+  const external = rule.external === true ? ' · 项目外' : ''
+  const lines = [`规范类型：${ruleKindLabel(rule.kind)}${external} · ${rule.size} 字节`]
+  const sections = rule.sections ?? []
+  if (sections.length === 0) {
+    lines.push('该文件没有分节（只有 Markdown 按标题切分）。')
+    return lines
+  }
+  lines.push(`分节 ${sections.length} 个：`)
+  for (const section of sections) {
+    lines.push(`- ${section.title}（第 ${section.line} 行）`)
+    if (section.text !== '') lines.push(`  ${section.text}`)
+    if ((section.keywords ?? []).length > 0) lines.push(`  关键词：${section.keywords.join('、')}`)
+  }
+  return lines
+}
+
+/**
+ * Count rules entries per kind, for the status line.
+ *
+ * @param {Record<string, object>} rules - the `agent_rules_index` block.
+ * @returns {Record<string, number>} kind → count.
+ */
+function countRuleKinds(rules) {
+  /** @type {Record<string, number>} */
+  const counts = {}
+  for (const entry of Object.values(rules)) {
+    const kind = typeof entry?.kind === 'string' ? entry.kind : 'unknown'
+    counts[kind] = (counts[kind] ?? 0) + 1
+  }
+  return counts
+}
+
+// ---------------------------------------------------------------------------
 // building
 // ---------------------------------------------------------------------------
 
@@ -1716,6 +2129,312 @@ export function buildRelations(contentLogic) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// sharding: one 10 MB file became a directory
+// ---------------------------------------------------------------------------
+//
+// A single index for a mid-sized Java project passes 10 MB, and no model should
+// ever have to read that. The layout is now a lookup table plus shards:
+//
+//   .dsh/index/master_index.json   project_meta + the macro directory tree +
+//                                  the shard manifest (~30 KB, always cheap)
+//   .dsh/index/shards/*.json       the per-file entries, one shard per business
+//                                  area, each capped at SHARD_MAX_BYTES
+//   .dsh/index/logic_rules.json    every file's business rules, on their own
+//   .dsh/index/agent_rules.json    the Agent's own rules, sliced per heading
+//
+// Reading is a three-step lookup: master for the shape, one shard for the file,
+// then `read` with a line offset for the ~50 lines that matter. The in-memory
+// shape is unchanged, so every reader below still sees one `index` object.
+
+/**
+ * Business area a file belongs to, which decides its shard.
+ *
+ * Order matters: `service/impl/` must be tested before `service/`, and
+ * `domain/vo/req/` before `domain/vo/`.
+ *
+ * @param {string} relPath - path relative to the project root.
+ * @returns {string} the group name.
+ */
+export function shardOf(relPath) {
+  const path = toPosix(relPath)
+  if (/\/domain\/entity\//.test(path)) return 'entity'
+  if (/\/service\/impl\//.test(path)) return 'service_impl'
+  if (/\/service\//.test(path)) return 'service'
+  if (/\/controller\//.test(path)) return 'controller'
+  if (/\/mapper\//.test(path) || /src\/main\/resources\/mapper\//.test(path)) return 'mapper'
+  if (/\/domain\/vo\/req\//.test(path)) return 'req'
+  if (/\/domain\/vo\/rep\//.test(path)) return 'rep'
+  if (/\/domain\/vo\//.test(path)) return 'vo'
+  if (/\/domain\/dto\//.test(path)) return 'dto'
+  return 'other'
+}
+
+/**
+ * Drop structurally empty values, keep meaningful falsy ones.
+ *
+ * `0`, `false` and `''` carry meaning (`is_delete: 0`, an empty comment that
+ * says "no comment"), so only `null`, `undefined`, `[]` and `{}` go.
+ */
+function pruneValue(value) {
+  if (value === null || value === undefined) return undefined
+  if (Array.isArray(value)) {
+    const kept = value.map(pruneValue).filter((item) => item !== undefined)
+    return kept.length === 0 ? undefined : kept
+  }
+  if (typeof value === 'object') {
+    const kept = {}
+    for (const key of Object.keys(value)) {
+      const pruned = pruneValue(value[key])
+      if (pruned !== undefined) kept[key] = pruned
+    }
+    return Object.keys(kept).length === 0 ? undefined : kept
+  }
+  return value
+}
+
+/** One shard payload: entries under `files`, freshness evidence under `meta`. */
+function shardPayload(records) {
+  const files = {}
+  const meta = {}
+  for (const record of records) {
+    meta[record.rel] = record.meta
+    if (record.logic !== null) files[record.rel] = record.logic
+  }
+  return { files, meta }
+}
+
+function shardBytes(records) {
+  return Buffer.byteLength(JSON.stringify(shardPayload(records)), 'utf8')
+}
+
+/**
+ * Last-resort split: one directory that cannot be divided any further.
+ *
+ * Measured in *payload* bytes, not record bytes: a record's path appears twice
+ * in the payload (once as a `files` key, once as a `meta` key), and a shard
+ * measured on the single occurrence lands a few KB above the ceiling.
+ */
+function chunkRecords(records, limit) {
+  const parts = []
+  let current = []
+  let currentBytes = 0
+  for (const record of records) {
+    const bytes = Buffer.byteLength(JSON.stringify(shardPayload([record])), 'utf8')
+    if (currentBytes + bytes > limit && current.length > 0) {
+      parts.push(current)
+      current = []
+      currentBytes = 0
+    }
+    current.push(record)
+    currentBytes += bytes
+  }
+  if (current.length > 0) parts.push(current)
+  return parts
+}
+
+/**
+ * Split records until every part fits, by path prefix first.
+ *
+ * Prefix splitting keeps a shard answerable by name — `service_impl.wip-service`
+ * reads as "the wip-service service implementations" — so the fallback to
+ * size-based chunks is only reached for a single directory that is itself too
+ * large (142 service impls under one package, for instance).
+ */
+function splitRecords(prefix, records, limit) {
+  if (shardBytes(records) <= limit) return [{ prefix, records }]
+  const groups = new Map()
+  for (const record of records) {
+    const rest = prefix === '' ? record.rel : record.rel.slice(prefix.length + 1)
+    const cut = rest.indexOf('/')
+    const segment = cut === -1 ? '(leaf)' : rest.slice(0, cut)
+    if (!groups.has(segment)) groups.set(segment, [])
+    groups.get(segment).push(record)
+  }
+  if (groups.size < 2) {
+    return chunkRecords(records, limit).map((part, index) => ({
+      prefix: prefix === '' ? `~${index + 1}` : `${prefix}~${index + 1}`,
+      records: part
+    }))
+  }
+  const parts = []
+  for (const segment of [...groups.keys()].sort()) {
+    const childPrefix =
+      segment === '(leaf)' ? prefix : prefix === '' ? segment : `${prefix}/${segment}`
+    parts.push(...splitRecords(childPrefix, groups.get(segment), limit))
+  }
+  return parts
+}
+
+/**
+ * Lay the in-memory index out as a master file plus shards.
+ *
+ * @param {object} index - a built index.
+ * @param {number} [limit] - shard ceiling in bytes.
+ * @returns {{master: object, shards: object[], logicRules: object, agentRules: object}} the layout.
+ */
+export function buildShards(index, limit = SHARD_MAX_BYTES) {
+  const logic = index.content_logic_index ?? {}
+  const logicRules = {}
+  const byGroup = new Map()
+
+  for (const directory of index.directory_index ?? []) {
+    for (const child of directory.children ?? []) {
+      const entry = logic[child.path] ?? null
+      let pruned = null
+      if (entry !== null) {
+        const copy = { ...entry }
+        if (Array.isArray(copy.logic_details) && copy.logic_details.length > 0) {
+          logicRules[child.path] = copy.logic_details
+        }
+        delete copy.logic_details
+        pruned = pruneValue(copy) ?? {}
+      }
+      const group = shardOf(child.path)
+      if (!byGroup.has(group)) byGroup.set(group, [])
+      byGroup.get(group).push({
+        rel: child.path,
+        meta: pruneValue({ language: child.language, summary: child.summary, hash: child.hash }) ?? {},
+        logic: pruned
+      })
+    }
+  }
+
+  const shards = []
+  for (const group of [...byGroup.keys()].sort()) {
+    for (const part of splitRecords('', byGroup.get(group), limit)) {
+      const name = part.prefix === '' ? group : `${group}.${part.prefix.replace(/[/~]/g, '_')}`
+      shards.push({
+        group,
+        name,
+        file: `${SHARDS_DIR}/${name}.json`,
+        prefix: part.prefix,
+        count: part.records.length,
+        payload: shardPayload(part.records)
+      })
+    }
+  }
+
+  const master = {
+    index_version: INDEX_VERSION,
+    project_meta: index.project_meta ?? {},
+    // The macro tree only: no file lists, no hashes. The per-file facts live in
+    // the shards, so this file stays readable in one gulp no matter the size of
+    // the project.
+    directory_index: (index.directory_index ?? []).map((directory) => ({
+      path: directory.path,
+      file_count: (directory.children ?? []).length,
+      summary: directory.summary ?? ''
+    })),
+    shards: shards.map((shard) => ({
+      file: shard.file,
+      group: shard.group,
+      files: shard.count,
+      bytes: Buffer.byteLength(JSON.stringify(shard.payload), 'utf8')
+    })),
+    agent_rules: AGENT_RULES_FILE,
+    logic_rules: RULES_FILE
+  }
+
+  return { master, shards, logicRules, agentRules: index.agent_rules_index ?? {} }
+}
+
+/**
+ * Rebuild the single in-memory index from the split files.
+ *
+ * Returns the same shape the readers already expect, so `queryIndex`,
+ * `readIndexEntry`, `checkEntry` and the formatters needed no change.
+ *
+ * @param {object} paths - from `indexPaths`.
+ * @returns {Promise<object|null>} the index, or null when nothing is on disk.
+ */
+export async function loadIndexFiles(paths) {
+  const master = await readJson(paths.master)
+  if (master === null) return null
+  if (master.index_version !== INDEX_VERSION) return null
+
+  const directoryIndex = (master.directory_index ?? []).map((directory) => ({
+    path: directory.path,
+    type: 'directory',
+    summary: directory.summary ?? '',
+    children: []
+  }))
+  const byDirectory = new Map(directoryIndex.map((entry) => [entry.path, entry]))
+  const contentLogic = {}
+
+  for (const shard of master.shards ?? []) {
+    const payload = await readJson(join(paths.dir, ...String(shard.file).split('/')))
+    if (payload === null) continue
+    for (const [rel, entry] of Object.entries(payload.files ?? {})) contentLogic[rel] = entry
+    for (const [rel, meta] of Object.entries(payload.meta ?? {})) {
+      const directory = byDirectory.get(dirOf(rel))
+      if (directory === undefined) continue
+      directory.children.push({ path: rel, type: 'file', ...meta })
+    }
+  }
+  for (const directory of directoryIndex) {
+    directory.children.sort((left, right) => left.path.localeCompare(right.path))
+  }
+
+  const logicRules = (await readJson(paths.logicRules)) ?? {}
+  for (const [rel, details] of Object.entries(logicRules)) {
+    if (contentLogic[rel] === undefined) contentLogic[rel] = {}
+    contentLogic[rel].logic_details = details
+  }
+
+  const sortedLogic = {}
+  for (const key of Object.keys(contentLogic).sort()) sortedLogic[key] = contentLogic[key]
+
+  return {
+    project_meta: master.project_meta ?? {},
+    directory_index: directoryIndex,
+    content_logic_index: sortedLogic,
+    agent_rules_index: (await readJson(paths.agentRules)) ?? {}
+  }
+}
+
+/**
+ * Write the split layout, and remove shards the new layout no longer has.
+ *
+ * Shard files are written compactly: an indented 800 KB shard becomes 1.4 MB
+ * and breaks the very ceiling the split exists to respect. The master file
+ * stays indented — it is small, and humans read it.
+ *
+ * @param {object} paths - from `indexPaths`.
+ * @param {object} index - the built index.
+ * @returns {Promise<{shards: number, removed: number}>} what was written.
+ */
+export async function writeIndexFiles(paths, index) {
+  const layout = buildShards(index)
+  mkdirSync(paths.shards, { recursive: true })
+  await writeJsonAtomic(paths.master, layout.master)
+  await writeJsonAtomic(paths.logicRules, layout.logicRules)
+  await writeJsonAtomic(paths.agentRules, layout.agentRules)
+
+  const keep = new Set()
+  for (const shard of layout.shards) {
+    keep.add(`${shard.name}.json`)
+    await writeJsonAtomic(join(paths.shards, `${shard.name}.json`), shard.payload, { compact: true })
+  }
+  let removed = 0
+  let present = []
+  try {
+    present = await readdir(paths.shards)
+  } catch {
+    present = []
+  }
+  for (const entry of present) {
+    if (!entry.endsWith('.json') || keep.has(entry)) continue
+    try {
+      rmSync(join(paths.shards, entry))
+      removed += 1
+    } catch {
+      /* another process got there first */
+    }
+  }
+  return { shards: layout.shards.length, removed }
+}
+
 /**
  * An index with no content, used when nothing has been built yet.
  *
@@ -1731,7 +2450,8 @@ export function emptyIndex(projectName) {
       global_summary: '索引尚未构建。'
     },
     directory_index: [],
-    content_logic_index: {}
+    content_logic_index: {},
+    agent_rules_index: {}
   }
 }
 
@@ -1858,6 +2578,91 @@ export async function buildProjectIndex(options) {
     else bucket.push(child)
   }
 
+  // -------------------------------------------------------------------------
+  // the fourth block: the Agent's own rules
+  // -------------------------------------------------------------------------
+  //
+  // Reuse works exactly like the source loop above — an unchanged size+mtime
+  // reuses the previous entry (sections and all), and so does a changed mtime
+  // with an identical sha256. The cache entry is written only when the source
+  // loop has not already written one for the same key: a project doc is walked
+  // by both, and letting the rules pass overwrite it would make
+  // `directory_index` summaries flap between builds.
+  /** @type {Record<string, object>} */
+  const agentRules = {}
+  const ruleFiles = await collectAgentRuleFiles(root)
+  const previousRules = previous?.agent_rules_index ?? {}
+
+  for (const rule of ruleFiles) {
+    let info
+    try {
+      info = await stat(rule.absolute)
+    } catch {
+      skipped += 1
+      continue
+    }
+    if (!info.isFile()) {
+      skipped += 1
+      continue
+    }
+
+    const cached = cacheEntries[rule.key]
+    const previousRule = previousRules[rule.key]
+    const unchanged = cached !== undefined && cached.size === info.size && cached.mtimeMs === info.mtimeMs
+    if (unchanged && previousRule !== undefined) {
+      agentRules[rule.key] = previousRule
+      if (nextEntries[rule.key] === undefined) nextEntries[rule.key] = cached
+      reused += 1
+      continue
+    }
+    if (cached !== undefined && previousRule !== undefined && now - info.mtimeMs < SETTLE_MS) {
+      agentRules[rule.key] = previousRule
+      if (nextEntries[rule.key] === undefined) nextEntries[rule.key] = cached
+      skipped += 1
+      settling += 1
+      continue
+    }
+
+    let source
+    try {
+      source = await readFile(rule.absolute, 'utf8')
+    } catch {
+      skipped += 1
+      continue
+    }
+    const hash = createHash('sha256').update(source).digest('hex')
+    if (previousRule !== undefined && previousRule.hash === hash) {
+      agentRules[rule.key] = previousRule
+      if (nextEntries[rule.key] === undefined) {
+        nextEntries[rule.key] =
+          cached ?? { size: info.size, mtimeMs: info.mtimeMs, hash, summary: previousRule.summary ?? '' }
+      }
+      reused += 1
+      continue
+    }
+
+    const language = languageOf(rule.path)
+    const summary = ruleSummary(source, rule.path)
+    agentRules[rule.key] = {
+      kind: rule.kind,
+      path: rule.path,
+      external: rule.external,
+      language,
+      size: info.size,
+      hash,
+      summary,
+      sections: language === 'Markdown' ? splitMarkdownSections(source) : []
+    }
+    if (nextEntries[rule.key] === undefined) {
+      nextEntries[rule.key] = { size: info.size, mtimeMs: info.mtimeMs, hash, summary }
+    }
+    parsed += 1
+  }
+
+  /** @type {Record<string, object>} */
+  const sortedRules = {}
+  for (const key of Object.keys(agentRules).sort()) sortedRules[key] = agentRules[key]
+
   const directoryIndex = [...buckets.entries()]
     .sort((left, right) => left[0].localeCompare(right[0]))
     .map(([path, children]) => ({
@@ -1893,12 +2698,14 @@ export async function buildProjectIndex(options) {
       file_count: fileCount,
       global_summary: truncate(
         `${projectName}：${directoryIndex.length} 个目录、${fileCount} 个文件；语言分布 ${topLanguages}；` +
-          `逻辑条目 ${Object.keys(sortedLogic).length} 个（Java/XML）。索引 v${INDEX_VERSION}，由 dsh-wip-codegen-agent 的后台监听器生成。`,
+          `逻辑条目 ${Object.keys(sortedLogic).length} 个（Java/XML）；规范条目 ${Object.keys(sortedRules).length} 个。` +
+          `索引 v${INDEX_VERSION}，由 dsh-wip-codegen-agent 的后台监听器生成。`,
         400
       )
     },
     directory_index: directoryIndex,
-    content_logic_index: sortedLogic
+    content_logic_index: sortedLogic,
+    agent_rules_index: sortedRules
   }
 
   return {
@@ -2120,6 +2927,39 @@ export function queryIndex(index, query, limit = 20) {
     }
   }
 
+  // The Agent's own rules. A section is scored separately from its file: asking
+  // for `导出` should land on §13.2, not merely on "the spec".
+  for (const rule of Object.values(index.agent_rules_index ?? {})) {
+    const pathScore = score(rule.path, needle)
+    if (pathScore > 0) {
+      hits.push({
+        score: pathScore,
+        hit: {
+          kind: 'rule',
+          path: rule.path,
+          label: `${rule.path} · ${ruleKindLabel(rule.kind)}`,
+          detail: truncate(rule.summary ?? '')
+        }
+      })
+    }
+    for (const section of rule.sections ?? []) {
+      const titleScore = score(section.title, needle)
+      const keywordHit = (section.keywords ?? []).some((word) => collapse(word).toLowerCase().includes(needle))
+      const textHit = collapse(section.text).toLowerCase().includes(needle)
+      const sectionScore = Math.max(titleScore, keywordHit ? 60 : 0, textHit ? 35 : 0)
+      if (sectionScore === 0) continue
+      hits.push({
+        score: sectionScore,
+        hit: {
+          kind: 'rule-section',
+          path: rule.path,
+          label: `${rule.path} · ${section.title}${atLine(section.line)}`,
+          detail: truncate(section.text)
+        }
+      })
+    }
+  }
+
   hits.sort((left, right) => right.score - left.score || left.hit.path.localeCompare(right.hit.path))
   return hits.slice(0, Math.max(1, limit)).map((entry) => entry.hit)
 }
@@ -2144,6 +2984,21 @@ export function readIndexEntry(index, relPath, symbol) {
     keys.find((candidate) => candidate.endsWith(`/${wanted}`)) ??
     keys.find((candidate) => candidate.endsWith(wanted)) ??
     null
+
+  if (key === null) {
+    // Not a source file — but it may still be a rules entry (the spec, an
+    // AGENTS.md, a doc). Those carry `sections` instead of classes and methods.
+    const rule = readRuleEntry(index, wanted, symbol)
+    if (rule !== null) {
+      return {
+        path: rule.path,
+        directory: null,
+        file: { path: rule.path, type: 'file', language: rule.language, summary: rule.summary, hash: rule.hash },
+        logic: null,
+        rule
+      }
+    }
+  }
 
   const directory = (index.directory_index ?? []).find((entry) =>
     (entry.children ?? []).some((child) => child.path === (key ?? wanted))
@@ -2215,9 +3070,12 @@ export async function checkEntry(index, root, relPath, readText) {
   if (entry.file === null) return null
 
   const indexedHash = typeof entry.file.hash === 'string' ? entry.file.hash : ''
+  // A rules entry may live outside the project (the spec body, the global
+  // AGENTS.md), in which case `path` is already absolute and must not be joined.
+  const target = entry.rule?.external === true ? entry.path : join(root, ...entry.path.split('/'))
   let currentHash = ''
   try {
-    const source = await readText(join(root, ...entry.path.split('/')))
+    const source = await readText(target)
     currentHash = createHash('sha256').update(source).digest('hex')
   } catch {
     currentHash = ''
@@ -2267,6 +3125,16 @@ export function formatStatus(state) {
       )
     }
   }
+  const ruleKinds = state.ruleKinds ?? {}
+  lines.push(
+    `规范条目 ${state.ruleCount ?? 0} 个（规范正文 ${ruleKinds.spec ?? 0} / 全局约定 ${ruleKinds['global-agents'] ?? 0} / ` +
+      `项目约定 ${ruleKinds['project-agents'] ?? 0} / 插件配置 ${ruleKinds['plugin-config'] ?? 0} / 文档 ${ruleKinds.doc ?? 0}）`
+  )
+  if ((state.shardCount ?? 0) > 0) {
+    lines.push(
+      `分片：${state.shardCount} 个，合计 ${Math.round((state.shardBytes ?? 0) / 1024)} KB（每片上限 800 KB）`
+    )
+  }
   const listener =
     state.state === 'building'
       ? '构建中'
@@ -2277,7 +3145,10 @@ export function formatStatus(state) {
   if (state.lastError !== null && state.lastError !== undefined) {
     lines.push(`最近一次构建失败：${state.lastError}`)
   }
-  lines.push('用法：action=query 按关键词检索；action=read 读单个文件的结构（可加 symbol 收窄）。')
+  lines.push(
+    '用法：action=query 按关键词检索（规范条目也在内，如「导出」「确认流程」「wbs_num」）；' +
+      'action=read 读单个文件的结构，path=system-prompt.md 可按节读规范（可加 symbol 收窄到一节）。'
+  )
   return lines.join('\n')
 }
 
@@ -2313,7 +3184,8 @@ export function formatRead(entry, relPath) {
   if (entry === null || entry === undefined) {
     return (
       `索引里没有「${relPath}」。\n` +
-      '先用 action=query 找一个文件路径；索引只收录 Java 与 MyBatis XML 的结构化条目，其它文件看 directory_index 的摘要。'
+      '先用 action=query 找一个文件路径；Java 与 MyBatis XML 在 content_logic_index 里，' +
+      'Agent 规范 / AGENTS.md / 插件配置 / docs 文档在 agent_rules_index 里（如 path=system-prompt.md）。'
     )
   }
   if (entry.file === null && entry.logic === null && entry.directory === null) {
@@ -2337,6 +3209,11 @@ export function formatRead(entry, relPath) {
       lines.push(`sha256：${hash}`)
       lines.push('可信度：用 action=verify 与磁盘比对；一致就可以直接照着上面的结构改，不必先全量读源码，不一致必须先自己读这个文件。')
     }
+  }
+
+  if (entry.rule !== undefined && entry.rule !== null) {
+    lines.push(...ruleSectionLines(entry.rule))
+    return lines.join('\n')
   }
 
   const logic = entry.logic
@@ -2514,10 +3391,17 @@ async function readJson(path) {
   }
 }
 
-/** Write a file atomically: a reader never sees a half-written index. */
-async function writeJsonAtomic(path, value) {
+/**
+ * Write a file atomically: a reader never sees a half-written index.
+ *
+ * `compact` drops the indentation. A shard is capped at 800 KB as a data
+ * structure; indenting it would push the file past 1.4 MB and defeat the
+ * ceiling the sharding exists to enforce.
+ */
+async function writeJsonAtomic(path, value, options = {}) {
   const temporary = `${path}.tmp`
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+  const body = options.compact === true ? JSON.stringify(value) : JSON.stringify(value, null, 2)
+  await writeFile(temporary, `${body}\n`, 'utf8')
   await rename(temporary, path)
 }
 
@@ -2565,7 +3449,7 @@ export function createProjectIndexService(options) {
 
   async function loadIndex() {
     if (cachedIndex !== null) return cachedIndex
-    cachedIndex = await readJson(paths.index)
+    cachedIndex = await loadIndexFiles(paths)
     return cachedIndex
   }
 
@@ -2587,14 +3471,24 @@ export function createProjectIndexService(options) {
           full
         })
         mkdirSync(paths.dir, { recursive: true })
-        await writeJsonAtomic(paths.index, result.index)
+        // A pre-split index is a single 10 MB file that no longer matches the
+        // layout; it would be dead weight next to the shards, so it goes.
+        if (existsSync(paths.legacy)) {
+          try {
+            rmSync(paths.legacy)
+            log('project-index: 已删除旧版单文件索引 project_index.json')
+          } catch (error) {
+            warn(`project-index: 旧版单文件索引删除失败（${error?.message ?? error}）`)
+          }
+        }
+        const layout = await writeIndexFiles(paths, result.index)
         await writeJsonAtomic(paths.cache, result.cache)
         cachedIndex = result.index
         lastBuildAt = now()
         expiresAt = lastBuildAt + LEASE_MS
         lastError = null
         log(
-          `project-index: ${reason} 构建完成 · ${result.files} 个文件（重解析 ${result.parsed}，复用 ${result.reused}，跳过 ${result.skipped}）`
+          `project-index: ${reason} 构建完成 · ${result.files} 个文件（重解析 ${result.parsed}，复用 ${result.reused}，跳过 ${result.skipped}）· ${layout.shards} 个分片`
         )
         // A file that changed within SETTLE_MS of this build was skipped as
         // mid-write, and no further watch event is coming for it — the burst
@@ -2681,9 +3575,10 @@ export function createProjectIndexService(options) {
   async function status() {
     const index = await loadIndex()
     const meta = index?.project_meta ?? null
+    const master = await readJson(paths.master)
     return {
       root,
-      indexPath: paths.index,
+      indexPath: paths.master,
       exists: index !== null,
       state,
       now: now(),
@@ -2691,8 +3586,12 @@ export function createProjectIndexService(options) {
       lastBuildAt,
       lastError,
       meta,
+      shardCount: (master?.shards ?? []).length,
+      shardBytes: (master?.shards ?? []).reduce((sum, shard) => sum + (shard.bytes ?? 0), 0),
       directoryCount: index?.directory_index?.length ?? 0,
       logicCount: Object.keys(index?.content_logic_index ?? {}).length,
+      ruleCount: Object.keys(index?.agent_rules_index ?? {}).length,
+      ruleKinds: countRuleKinds(index?.agent_rules_index ?? {}),
       watcherActive
     }
   }
@@ -2737,15 +3636,20 @@ export function createProjectIndexService(options) {
 
 /** Tool description shown to the model. */
 const TOOL_DESCRIPTION =
-  '读取当前项目的复合索引（.dsh/index/project_index.json），在不动源码的前提下看清项目结构与业务逻辑。' +
+  '读取当前项目的复合索引（.dsh/index/ 下的 master_index.json + shards/ 分片 + logic_rules.json + agent_rules.json），' +
+  '在不动源码的前提下看清项目结构与业务逻辑。' +
+  '索引按业务域拆成多个文件，每个分片不超过 800 KB，所以任何一次读取都不会把整个项目塞进上下文。' +
   '索引由后台监听器维护，每 30 分钟或检测到文件变化时增量更新；每个文件条目都带该文件的 sha256。' +
   '信任规则按 hash 判断，不按时间判断：action=verify 比对索引里的 hash 与磁盘现状——' +
   'hash 一致说明索引描述的就是当前这份文件，可以直接用它的类/字段/方法/规则回答，也可以直接基于它改源码，不必先全量读一遍；' +
   'hash 不一致说明这一条已过期，改源码前必须自己读该文件。' +
-  'action=status 先看索引是否就绪；action=query 按关键词（文件路径/类名/方法名/业务规则/接口 URL/表列名/常量值）检索；' +
+  'action=status 先看索引是否就绪（含分片数与总字节）；action=query 按关键词（文件路径/类名/方法名/业务规则/接口 URL/表列名/常量值）检索；' +
   'action=read 读某个文件的结构化条目（类、字段、方法、构造器、常量与枚举值、注解参数、行号、引用关系、业务规则），' +
   '可用 symbol 收窄到单个类或方法；' +
   'action=verify 校验某个文件的条目是否仍然可信（改源码之前做这一步）；action=build 强制全量重建（通常不必手动调用）。' +
+  '索引的第四块 agent_rules_index（落在 agent_rules.json）收录了 Agent 规范正文（§一～§十七）、AGENTS.md 全局/项目约定、插件配置与 docs 文档：' +
+  'action=query 用关键词（如「导出」「确认流程」「wbs_num」）可直接命中规范条目，' +
+  'action=read path=system-prompt.md 可按节读规范，action=verify 对它同样比对 sha256；' +
   '本工具不会等待构建完成：索引缺失时它直接说明现状，此时改用 grep/glob/read 回答当前问题，' +
   '并告诉用户「已触发后台索引构建，当前我先基于原生检索为您解答」。'
 
@@ -2765,11 +3669,13 @@ const TOOL_PARAMETERS = {
     },
     path: {
       type: 'string',
-      description: 'action=read 或 action=verify 时的文件路径，相对项目根，可只写路径后缀。'
+      description:
+        'action=read 或 action=verify 时的文件路径，相对项目根，可只写路径后缀；' +
+        '规范条目也可用（如 system-prompt.md、AGENTS.md）。'
     },
     symbol: {
       type: 'string',
-      description: 'action=read 时可选，类名或方法名，用于把结果收窄到一个符号。'
+      description: 'action=read 时可选，类名或方法名；对规范条目则按节标题（或节内出现的词）收窄。'
     },
     limit: {
       type: 'integer',

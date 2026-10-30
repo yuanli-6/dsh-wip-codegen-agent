@@ -154,30 +154,67 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 >   Mapper 接口 ↔ XML 双向互指（`mapper_interface` / `mapper_xml`）。
 > - **字段中文说明**回退到 `@Schema(description)`：全库空注释 58.5% → 25%，实体与 Req 52.8% → 7%。
 
+> **v2.7.0 把索引从一个文件拆成一个目录**（`INDEX_VERSION` 3 → 4，旧的 `project_index.json` 检测到
+> 就删，`file-cache.json` 一并重建）：
+>
+> - **起因是实测体量**：wip-srv 的 `project_index.json` 长到 **10,910,246 字节**，其中 `content_logic_index`
+>   一项就 6,295,822 字符 / 1627 条（`fields` 占 32.4%、`methods` 占 30.0%、`logic_details` 占 9.0%）。
+>   任何人打开它都会爆上下文 —— 索引存在的意义是省 token，而不是把上下文一次烧光。
+> - **改成 master + shards**：`master_index.json`（项目概况 + 宏观目录树 + 分片清单，**37 KB**）、
+>   `shards/*.json`（按业务域分片，**每片硬上限 800 KB**，实测 21 片、最大 795 KB、合计 5.8 MB）、
+>   `logic_rules.json`（全项目业务规则单独成片，770 KB）、`agent_rules.json`（规范正文/AGENTS.md/
+>   插件配置/docs 按标题切片，150 KB）。
+> - **超限先按路径前缀拆，再按大小切**：`service_impl` 一个包下 142 个 Impl 无法按目录拆开，于是
+>   `service_impl.wip-service_1.json`（119 个）/ `_2.json`（23 个）—— 拆分是确定性的，每次重建结果一致。
+> - **分片写紧凑、master 写缩进**：同一份数据加两空格缩进会从 5.8 MB 涨到 6.1 MB 且出现两片超 1 MB，
+>   所以分片用 `JSON.stringify(value)` 无缩进写，master 保留缩进方便人读。
+> - **读取侧零改动**：`loadIndexFiles()` 把分片合并回内存里的旧四块形状，`queryIndex` / `readIndexEntry` /
+>   `checkEntry` / `formatRead` / `formatVerify` 一行没改 —— 对外契约不变，只换了存储形态。
+> - **§十七 重写**：新增 17.2「三步走」（master 看形状 → query 定位行号 → **局部读 `line ~ line+50`，
+>   严禁超过 300 行**）与 17.5「终端命令防爆内存」（禁 `Format-Table -Wrap`、搜索必须限行、
+>   带后缀过滤、只输出文件名）。
+
 ### 复合索引：先查索引，再决定读不读源码（v2.5.0 起）
 
 规范 §十七 要求：回答项目结构 / 业务逻辑类问题前，**先查索引**；命中且**文件 hash 未变**时用
-`directory_index` 定位文件、用 `methods` / `logic_details` 拿逻辑，**除非用户明确要求改源码，
-否则不全量读源码**。这条规则要落地，缺的从来不是提示词，而是那份索引本身 —— 没人维护的索引
-一天就过期，过期索引比没有索引更坏（它会自信地给出错答案）。
+`master_index.json` 定位模块、用分片里的 `methods` / `logic_details` 拿逻辑，**除非用户明确要求
+改源码，否则不全量读源码**。这条规则要落地，缺的从来不是提示词，而是那份索引本身 —— 没人维护
+的索引一天就过期，过期索引比没有索引更坏（它会自信地给出错答案）。
 
-落盘位置由规范钉死，就在**项目根目录**下（不是插件安装目录）：
+**v2.7.0 把索引从一个文件拆成一个目录。** 单体索引在 wip-srv 上长到 **10.9 MB**（`content_logic_index`
+一项就 6.3 MB），任何人打开它都会爆上下文 —— 索引存在的意义是省 token，而不是把上下文一次烧光。
+现在按业务域分片，**每片硬上限 800 KB**：
 
 ```
-<项目根>/.dsh/index/project_index.json   # 三块：project_meta / directory_index / content_logic_index
-<项目根>/.dsh/index/file-cache.json      # 旁挂：每个文件的 size + mtime + sha256（增量记账）
+<项目根>/.dsh/index/master_index.json      # 项目概况 + 宏观目录树 + 分片清单（~37 KB，可整读）
+<项目根>/.dsh/index/shards/entity.json     # 每文件条目，按业务域分片
+<项目根>/.dsh/index/shards/service_impl.wip-service_1.json
+<项目根>/.dsh/index/shards/controller.json
+<项目根>/.dsh/index/shards/mapper.json     # …共 21 片，全部 ≤ 800 KB
+<项目根>/.dsh/index/logic_rules.json       # 全项目业务规则，按文件路径索引（~770 KB）
+<项目根>/.dsh/index/agent_rules.json       # 规范正文/AGENTS.md/插件配置/docs，按标题切片（~150 KB）
+<项目根>/.dsh/index/file-cache.json        # 旁挂：每个文件的 size + mtime + sha256（增量记账）
 ```
 
-`project_index.json` 严格只有规范要求的三块 —— 但每个 `directory_index` 子项额外带一个 `hash`
-字段（该文件内容的 sha256）。它不属于规范的三块结构之外的新块，只是文件条目上的一个属性，
-而且是**可信度的唯一凭证**：模型靠它判断「这条索引还对不对」。
+分片规则是确定性的（`shardOf()`）：`domain/entity` → `entity`、`service/impl` → `service_impl`、
+`service` → `service`、`controller` → `controller`、`mapper`（Java 与 XML 同片）→ `mapper`、
+`domain/vo/req|rep|vo` → `req|rep|vo`、`domain/dto` → `dto`，其余按模块名进 `other.<模块>`。
+一片超 800 KB 时先按路径前缀继续拆（`service_impl.wip-service_1.json`），一个目录拆不动了才按
+大小切 —— 所以不存在「某一片特别大」的情况。
+
+**旧的单文件 `project_index.json` 检测到就删**（监听器在 `rebuild()` 里做），`file-cache.json`
+一并按新版本重建。索引里每个文件条目仍然带 `hash`（该文件内容的 sha256），它是**可信度的唯一
+凭证**：模型靠它判断「这条索引还对不对」。
+
+**分片写紧凑、master 写缩进**：800 KB 的分片加上两空格缩进会变成 1.4 MB，正好突破拆分要守的上限；
+master 只有几十 KB，缩进保留，方便人直接读。
 
 `file-cache.json` 是增量的记账（size + mtime + sha256，用来决定要不要重读），与 `hash` 各司其职：
 前者省 IO，后者给模型凭证。两者都**不会被重装插件覆盖**。
 
 **可信度看 hash，不看时间**。`last_updated` 只说明索引什么时候建的，不说明条目还对不对：
 一秒前建的索引，若那个文件刚被改过而监听器还没跑，条目照样是旧的；反过来，三小时没重建的
-索引，只要文件没动过，条目就完全正确。所以 §17.2 把判据定成：
+索引，只要文件没动过，条目就完全正确。所以 §17.3 把判据定成：
 
 - `action=verify` 报 **hash 一致** ⇒ 索引描述的就是当前这份文件。可以直接回答，**也可以直接
   基于它改源码** —— 不必先全量读一遍，只读要改的那几行。
@@ -186,6 +223,10 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 
 `action=read` 的输出里**直接带着该文件的 `sha256`**：想同时要结构和可信凭证时一次调用就够，
 不必 `read` 完再补一次 `verify`。`verify` 留给「只关心 hash、不要结构」的场合。
+
+**三步走，且第 3 步有行数上限**（§17.2）：`master_index.json` 看形状 → `action=query` 定位文件
+与行号 → 用行号**局部读**源码（`line ~ line+50`，**严禁超过 300 行，严禁整文件通读**）。这条
+约束是硬的：即使 hash 一致、即使确信要看实现，也只能读那一段。
 
 这也是为什么监听器的 30 分钟租约只管「什么时候该重新扫一遍」，**不参与可信度判断**。
 

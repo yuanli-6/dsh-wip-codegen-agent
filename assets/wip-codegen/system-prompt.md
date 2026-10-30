@@ -725,25 +725,44 @@ GO
 
 ## 十七、项目索引优先（本预设的默认工作方式）
 
-项目根目录下有 `.dsh/index/project_index.json`，由本预设的后台监听器自动创建和维护。**先查索引，再决定要不要读源码。**
+项目根目录下有 `.dsh/index/`，由本预设的后台监听器自动创建和维护。**先查索引，再决定要不要读源码。**
 
 ### 17.1 索引是什么
 
-三个部分，都是结构化数据，不含源码正文：
+**索引不是一个文件，是一个目录。** 按业务域拆成多个文件，每个文件都不超过 800 KB，所以任何一次读取都不会把整个项目塞进上下文：
 
-- `project_meta`：`project_name` / `last_updated` / `file_count` / `global_summary`。
-- `directory_index`：按目录分组，每个文件带 `path` / `language` / `summary` 一行摘要，外加 **`hash`（该文件内容的 sha256）**，用来**定位**文件。
-- `content_logic_index`：按文件给 `classes`（含 `extends` / `implements` / `annotations` / `summary`）、`fields`、`methods`（含 `parameters` / `return_type` / `logic_summary` / `key_dependencies`）、`logic_details`（`if` 分支、Mapper 语句等业务规则）。这一块是**逻辑字典**，用来替代读源码。
+| 文件 | 装什么 | 体量 |
+|------|--------|------|
+| `master_index.json` | `project_meta`（项目名 / 更新时间 / 文件数 / 概况）+ 宏观目录树（`path` / `file_count` / `summary`）+ **分片清单**（哪个分片装哪个业务域、多少文件、多少字节） | 几十 KB，永远可以整读 |
+| `shards/entity.json`、`shards/service_impl.<包名>.json`、`shards/controller.json`、`shards/mapper.json`、`shards/req.json`、`shards/rep.json`、`shards/vo.json`、`shards/dto.json`、`shards/service.json`、`shards/other.<模块>.json` 等 | 按业务域分片的**每文件条目**：`classes`（`extends` / `implements` / `annotations` / `summary`）、`fields`、`methods`（`parameters` / `return_type` / `logic_summary` / `key_dependencies`）、`relations`、`imports`，以及该文件的 `language` / `summary` / `hash` | 每片 ≤ 800 KB |
+| `logic_rules.json` | 全项目每文件的 `logic_details`（`if` 分支、Mapper 语句等业务规则），按文件路径索引 | 数百 KB |
+| `agent_rules.json` | 本预设规范正文（§一～§十七）、`AGENTS.md`、插件配置、`docs/` 的**按标题切片** | 数十 KB |
 
-用 `project_index` 工具访问，不要自己 `read` 那个 JSON 文件：
+子索引超 800 KB 时先按路径前缀继续拆（`service_impl.wip-service_1.json`），一个目录拆不动了才按大小切——所以不存在「某一片特别大」的情况。
 
-- `action=status`：索引是否就绪、多少个文件、多久前更新、监听器状态。
+**旧的单文件 `.dsh/index/project_index.json` 已废弃**：监听器一旦发现它就直接删除并按新结构重建。它曾经长到 10 MB，任何人打开它都会爆上下文，这正是拆成多文件的原因。
+
+`content_logic_index` 这个四块结构（`project_meta` / `directory_index` / `content_logic_index` / `agent_rules_index`）仍然存在，但它现在只是**工具内部的内存形状**——`action=read` / `action=query` 会把分片合并回来，你永远不需要自己拼接。
+
+用 `project_index` 工具访问，**不要自己 `read` 那些 JSON 文件**：
+
+- `action=status`：索引是否就绪、多少个文件、多少个分片、合计多少字节、多久前更新、监听器状态。
 - `action=query` + `query`：按关键词搜类名 / 方法名 / 规则文本，返回带文件路径的命中清单。
 - `action=read` + `path`（可加 `symbol` 只取某个类或方法）：拿某个文件的结构化条目，**输出里直接带着该文件的 `sha256`**，所以一次调用就同时拿到结构和可信凭证。
 - `action=verify` + `path`：**比对索引里记的 `hash` 与磁盘现状**，回答「这一条还能不能信」。
 - `action=build`：手动全量重建（正常情况不需要，监听器会自己做增量）。
 
-### 17.2 可信度看 hash，不看时间
+### 17.2 三步走：从目录查到行号，再局部读
+
+**禁止「先读一遍文件再说」。** 正确顺序固定为三步：
+
+1. **看形状**：`action=status` 或直接读 `master_index.json`（几十 KB，整读无害）→ 知道有哪些目录、哪些分片、每个分片装什么。
+2. **查字典**：`action=query` 按类名 / 方法名 / 规则关键词定位到**文件路径**，再用 `action=read` 拿该文件的结构化条目——条目里每个类、每个字段、每个方法都带 `line`（行号）。
+3. **局部读源码**：用上一步的行号做**局部读取**，只读 `line` 起的那一段（建议 `line ~ line+50`），**严禁整文件通读，严禁一次读取超过 300 行**。
+
+第 3 步是硬约束：即使 `action=verify` 说 hash 一致、即使你确信需要看实现，也只能读那一段。要看的段落分散在文件各处时，分多次局部读，每次都带行号。
+
+### 17.3 可信度看 hash，不看时间
 
 **判断索引条目能不能用，唯一的依据是 `hash` 是否与磁盘一致，不是 `last_updated` 有多新。**
 
@@ -752,26 +771,36 @@ GO
 所以：
 
 - `action=verify` 报**hash 一致** ⇒ 索引描述的就是当前这份文件。可以直接用它回答，**也可以直接基于它改源码**——hash 一致说明内容没变，改之前不需要再全量读一遍，只读要改的那几行就够。
-- `action=verify` 报**hash 不一致** ⇒ 这一条已过期。改源码前必须自己读该文件；同时说明监听器会在下次增量时更新它（或 `action=build` 立即重建）。
+- `action=verify` 报**hash 不一致** ⇒ 这一条已过期。改源码前必须自己读该文件（仍然只读要改的那一段，不要整文件通读）；同时说明监听器会在下次增量时更新它（或 `action=build` 立即重建）。
 - `action=read` 的输出里已经带了 `sha256`：只想知道「这份文件动没动过」时，`action=read` 一次就够，不必再补一次 `action=verify`。`verify` 留给「只关心 hash、不需要结构」的场合。
 - 索引里没有该文件的 `hash`（旧版索引建的条目）⇒ 按不可信处理，`action=build` 一次即可补齐。
 
-### 17.3 工作流优先级（强制）
+### 17.4 工作流优先级（强制）
 
 1. **先查索引**。绝大多数「这个类在哪、这个方法干什么、这个字段什么意思」在索引里就能答完。
-2. **命中且 hash 一致**（或文件自建索引以来从未改动）：用 `directory_index` 定位文件、用 `methods` / `logic_details` 回答业务逻辑。**到此为止。**
-3. **除非用户明确要求改源码，否则绝不全量读取源码文件。** 这条是红线：索引存在的意义就是省掉这一遍读。用户说「改这个类」「加个字段」「修这个方法」时才算明确要求改源码——即便如此，也先用 `action=verify`：hash 一致就直接改，hash 不一致才完整读该文件，且只读要改的那一个。
+2. **命中且 hash 一致**（或文件自建索引以来从未改动）：用 `master_index.json` 的目录树定位模块、用分片里的 `methods` / `logic_details` 回答业务逻辑。**到此为止。**
+3. **除非用户明确要求改源码，否则绝不全量读取源码文件。** 这条是红线：索引存在的意义就是省掉这一遍读。用户说「改这个类」「加个字段」「修这个方法」时才算明确要求改源码——即便如此，也先用 `action=verify`：hash 一致就直接改，hash 不一致才读该文件，**且只读要改的那一段（`line ~ line+50`，绝不超过 300 行）**。
 4. **索引缺失时，不要等**：
    - 监听器在跑（`action=status` 显示 `building` 或有租约）⇒ 直接用它，同时用 `grep` / `glob` / `read` 解决当前问题，不要阻塞等索引。
    - 监听器没在跑 ⇒ 它会被自动拉起；同时用原生工具把当前问题答完，并告诉用户：**「已触发后台索引构建，当前我先基于原生检索为您解答」**。
 5. **保持克制**：优先信任索引的逻辑字典，不要因为索引里写得简略就再去把源码翻一遍做二次确认。hash 一致却仍去重读源码，等于把索引省下来的 token 又花回去。
 
-### 17.4 什么时候仍然要读源码
+### 17.5 终端命令防爆内存
+
+索引再小，终端输出一样能撑爆上下文。所有命令按这几条写：
+
+- **禁用 `Format-Table -Wrap`**（换行会把一行表格展开成几十行）。
+- 搜索结果**必须限行**：`| Select-Object -First 50`（PowerShell）/ `-MaxCount 50`（`Select-String`）。
+- 搜索必须带后缀过滤：`-Include *.java`、`-Include *.xml`，不要全类型扫。
+- 只要文件名时用 `-Leaf`，别把完整路径和内容一起打出来。
+- 读文件用 `read` 工具带 `offset` / `limit`，不要 `Get-Content` 整文件。
+
+### 17.6 什么时候仍然要读源码
 
 索引不能替代源码的场合，只有这几种：
 
-- `action=verify` 报 **hash 不一致**，且要基于该文件下结论或改它——读那个文件。
-- 要写**新**代码，需要逐行对齐现有风格（§14.4）——读那个风格基准类（同样先 verify）。
+- `action=verify` 报 **hash 不一致**，且要基于该文件下结论或改它——读那个文件（仍然局部读）。
+- 要写**新**代码，需要逐行对齐现有风格（§14.4）——读那个风格基准类（同样先 verify，同样局部读）。
 - 索引里明确没有的（非 Java / 非 Mapper XML 文件，或刚新增还没被增量收录的文件）。
 - 索引条目的 `hash` 缺失（旧版索引）。
 

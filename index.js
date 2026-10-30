@@ -81,10 +81,11 @@ const PERSONA_HOT_PACKAGE = 'dsh-wip-codegen-agent/persona-hot'
 /**
  * The project-index row this bundle ships itself.
  *
- * Owns the composite index at `<project>/.dsh/index/project_index.json` and the
- * `project_index` tool. A subpath for the same reason as the persona row: the
- * row resolves through the package `exports` map, so the file the loader mounts
- * is the file the package publishes.
+ * Owns the sharded index under `<project>/.dsh/index/` — `master_index.json` for
+ * the shape, `shards/*.json` for the per-file entries — and the `project_index`
+ * tool. A subpath for the same reason as the persona row: the row resolves
+ * through the package `exports` map, so the file the loader mounts is the file
+ * the package publishes.
  */
 const PROJECT_INDEX_PACKAGE = 'dsh-wip-codegen-agent/project-index'
 
