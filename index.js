@@ -67,6 +67,57 @@ const SPEC_FILE_URL = new URL('./assets/wip-codegen/system-prompt.md', import.me
 const COMPANION_PACKAGE = 'dsh-api-test-bundle'
 
 /**
+ * Host-tool compatibility — the "compatibility switch".
+ *
+ * Two tool rows are host-version specific, and a preset row that cannot be
+ * resolved fails the activation audit, which rejects the WHOLE preset:
+ *   - `@deepseek-ai/dsh-tool-schedule` exists only on hosts exposing the
+ *     `ctx.schedule` service (newer DSH). Mount it on an older host and the
+ *     code-generation Agent disappears.
+ *   - `@deepseek-ai/dsh-tool-subagent-control/list-agents` was removed from
+ *     newer hosts; leaving it mounted there is equally fatal.
+ *
+ * So the pair is chosen by one switch. `ctx.config.compat` is the explicit
+ * operator control; without it we auto-detect the host `schedule` service;
+ * and `buildDefinition()` without options stays old-host-safe so the offline
+ * self-checks keep their established row shape.
+ */
+
+/** Old-host-safe pair: no schedule row, list-agents still mounted. */
+export function defaultCompatibility() {
+  return { schedule: false, listAgents: true }
+}
+
+/** Coerce a partial / invalid compat value into a complete pair. */
+export function normalizeCompat(value) {
+  const base = defaultCompatibility()
+  if (!value || typeof value !== 'object') return base
+  return {
+    schedule: typeof value.schedule === 'boolean' ? value.schedule : base.schedule,
+    listAgents: typeof value.listAgents === 'boolean' ? value.listAgents : base.listAgents
+  }
+}
+
+/**
+ * Resolve the switch for a live activation: explicit config wins, then host
+ * capability detection, then the old-host-safe baseline.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} [ctx] - owning plugin context.
+ * @returns {{schedule: boolean, listAgents: boolean}} the resolved pair.
+ */
+export function compatibilityFrom(ctx) {
+  const explicit = ctx?.config?.compat
+  if (explicit !== undefined && explicit !== null) return normalizeCompat(explicit)
+  let hasSchedule = false
+  try {
+    hasSchedule = Boolean(ctx?.get?.('schedule', false) ?? ctx?.schedule)
+  } catch {
+    hasSchedule = false
+  }
+  return hasSchedule ? { schedule: true, listAgents: false } : defaultCompatibility()
+}
+
+/**
  * The persona row this bundle ships itself.
  *
  * Not `@deepseek-ai/dsh-persona`: that row takes the body as a config string,
@@ -264,12 +315,15 @@ function readSpec(warn) {
  * exactly what `PresetDefinition.disabled` accepts.
  *
  * @param {(message: string) => void} [warn] - sink for non-fatal diagnostics.
- * @param {{apiTest?: boolean}} [options] - `apiTest` overrides the resolvability probe (tests inject it).
+ * @param {{apiTest?: boolean, compat?: {schedule?: boolean, listAgents?: boolean}}} [options] -
+ *   `apiTest` overrides the resolvability probe (tests inject it); `compat`
+ *   overrides the host-tool compatibility switch (see `compatibilityFrom`).
  * @returns {{id: string, name: string, description: string, order: number, plugins: object[]}} the definition.
  */
 export function buildDefinition(warn, options = {}) {
   const spec = specBody(warn)
   const apiTest = options.apiTest ?? companionAvailable()
+  const compat = normalizeCompat(options.compat ?? defaultCompatibility())
 
   if (!apiTest) {
     warn?.(
@@ -357,6 +411,19 @@ export function buildDefinition(warn, options = {}) {
     }
   )
 
+  if (compat.schedule) {
+    plugins.push({
+      // Persistent reminders (`schedule_create` / `schedule_list` /
+      // `schedule_update` / `schedule_delete`) over the Host `ctx.schedule`
+      // service. The Host service row lives in `dsh-web-app`; this row only
+      // exposes its four model-facing tools. Mounted only when the host
+      // actually has that service, otherwise the activation audit would
+      // reject the whole preset (see `compatibilityFrom`).
+      id: 'tool-schedule',
+      name: '@deepseek-ai/dsh-tool-schedule'
+    })
+  }
+
   // The delegation group. One `cordis:group` row, because two of its members
   // publish services (`workflow-ptc` owns `workflowEngine`) and a provider
   // without an `isolate` realm publishes into the ROOT realm, where the
@@ -383,10 +450,14 @@ export function buildDefinition(warn, options = {}) {
         id: 'tool-subagent-control',
         name: '@deepseek-ai/dsh-tool-subagent-control'
       },
-      {
-        id: 'tool-subagent-list-agents',
-        name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
-      },
+      ...(compat.listAgents
+        ? [
+            {
+              id: 'tool-subagent-list-agents',
+              name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+            }
+          ]
+        : []),
       {
         id: 'tool-subagent',
         name: '@deepseek-ai/dsh-tool-subagent',
@@ -455,7 +526,7 @@ export function apply(ctx) {
 
   let definition
   try {
-    definition = buildDefinition(warn)
+    definition = buildDefinition(warn, { compat: compatibilityFrom(ctx) })
   } catch (error) {
     // buildDefinition reads the asset and should not throw, but a preset the
     // registry never sees must still not break the surrounding activation.

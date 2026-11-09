@@ -44,6 +44,29 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 > 插件属于**本机 profile**（`$DSH_HOME/profiles/<profile>/`），不属于 DSH 账号。
 > 换机器需要重新执行一次上面的安装——这正是走 GitHub 的意义。
 
+### 宿主版本兼容开关（v2.7.2 起）
+
+预设里有两行工具是**跟 DSH 宿主版本绑定**的，挂错一行会让整条预设激活失败（Agent 直接消失）：
+
+| 工具行 | 旧宿主 | 新宿主 |
+|---|---|---|
+| `@deepseek-ai/dsh-tool-schedule` | 不存在 | 存在（提供 `ctx.schedule` 服务，暴露 `schedule_create` / `schedule_list` / `schedule_update` / `schedule_delete`） |
+| `@deepseek-ai/dsh-tool-subagent-control/list-agents` | 存在 | 已移除 |
+
+插件按一个开关决定挂哪一对，**默认自动探测**：激活时若能取到宿主的 `schedule` 服务，就用「新宿主」组合（挂 `tool-schedule`、去掉 `list-agents`）；取不到就用「旧宿主」组合。离线自检（`buildDefinition()` 不带参数）固定用旧宿主组合，保证行形状稳定。
+
+需要手动锁定时，在**本机 profile 的 `cordis.patch.yml`** 里给本插件的行加一段 id-targeted 覆盖（不要改仓库自带的 `cordis.patch.yml`，那份是给所有机器用的）：
+
+```yaml
+- id: dsh-wip-codegen-agent
+  config:
+    compat:
+      schedule: true      # 挂 tool-schedule
+      listAgents: false   # 不挂 list-agents
+```
+
+`config.compat` 优先级高于自动探测；两个键都是 boolean，缺省时回落到旧宿主组合。改完**重载插件 / 新开对话**生效。换机器、重装插件后按上面方式确认一次即可，**不必再把 `index.js` 当本机补丁手改**。
+
 ### 装之前要先做一件事（重要）
 
 如果你之前在 **设置 → Agent 中心** 里手工建过同名预设，**先把它删掉**。
@@ -180,6 +203,12 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 > **有项目索引且 `action=verify` hash 一致（源码没变过）时，优先按 §17.2 三步走用多层级项目索引
 > 解决问题**，不默认读源码全文；§17.6 同步收窄、§十五 追加一条会话沉淀、README 能力表一并改口径。
 > 纯正文改动，热加载即生效，不必重装。
+
+> **v2.7.2 把本机兼容补丁收成「兼容开关」**：此前为了让 Agent 在新版 DSH 上可用，只能手改已安装插件
+> 的 `index.js`（加 `tool-schedule` 行、删 `tool-subagent-list-agents` 行），重装 / 换机器就会被仓库版
+> 覆盖、兼容问题复现。现在这两行由 `config.compat` / 宿主 `schedule` 服务自动探测决定，仓库保持一份
+> 通用源码；`verify.mjs` 对两种组合都加了断言。升级后请按上面「宿主版本兼容开关」确认本机配置，
+> 不要再手改 `index.js`。
 
 ### 复合索引：先查索引，再决定读不读源码（v2.5.0 起）
 

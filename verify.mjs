@@ -208,7 +208,7 @@ check('spec makes the project index the default way in (§十七)', () => {
 })
 
 // ── the definition handed to agentPresets.register() ──────────────────────────
-const { buildDefinition, companionAvailable, name: pluginName, inject } = await import('./index.js')
+const { buildDefinition, companionAvailable, defaultCompatibility, normalizeCompat, compatibilityFrom, name: pluginName, inject } = await import('./index.js')
 
 // The persona row is this bundle's own module; importing it here is what lets
 // the prompt body be asserted without standing up a DSH host. It has no harness
@@ -450,6 +450,59 @@ check('the persona is identical with and without the companion', () => {
   const without = buildDefinition(undefined, { apiTest: false })
   const specOf = (d) => d.plugins.find((r) => r.name === PERSONA_ROW).config.specCharacters
   assert(specOf(withRows) === specOf(without), 'the spec text changed with the companion gate')
+})
+
+console.log('')
+console.log('host-tool compatibility switch (schedule / list-agents)')
+
+const SCHEDULE_ROW = '@deepseek-ai/dsh-tool-schedule'
+const LIST_AGENTS_ROW = '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+const namesOf = (d) => flattenRows(d.plugins).map((r) => r.name)
+const compatLegacy = buildDefinition(undefined, { apiTest: true, compat: { schedule: false, listAgents: true } })
+const compatModern = buildDefinition(undefined, { apiTest: true, compat: { schedule: true, listAgents: false } })
+
+check('baseline (no compat option) stays old-host-safe', () => {
+  const base = buildDefinition(undefined, { apiTest: true })
+  assert(!namesOf(base).includes(SCHEDULE_ROW), 'baseline must not mount tool-schedule')
+  assert(namesOf(base).includes(LIST_AGENTS_ROW), 'baseline must mount list-agents')
+})
+check('legacy mode mounts list-agents and omits tool-schedule', () => {
+  assert(!namesOf(compatLegacy).includes(SCHEDULE_ROW), 'tool-schedule mounted in legacy mode')
+  assert(namesOf(compatLegacy).includes(LIST_AGENTS_ROW), 'list-agents missing in legacy mode')
+})
+check('modern mode mounts tool-schedule and omits list-agents', () => {
+  assert(namesOf(compatModern).includes(SCHEDULE_ROW), 'tool-schedule missing in modern mode')
+  assert(!namesOf(compatModern).includes(LIST_AGENTS_ROW), 'list-agents mounted in modern mode')
+})
+check('the two modes swap exactly one row each way (total row count stable)', () => {
+  assert(namesOf(compatLegacy).length === namesOf(compatModern).length, 'row count differs between modes')
+})
+check('defaultCompatibility() is the old-host-safe pair', () => {
+  assert(defaultCompatibility().schedule === false && defaultCompatibility().listAgents === true, 'baseline drifted')
+})
+check('normalizeCompat fills missing and rejects non-boolean fields', () => {
+  const partial = normalizeCompat({ schedule: true })
+  assert(partial.schedule === true && partial.listAgents === true, 'missing listAgents not defaulted')
+  const dirty = normalizeCompat({ schedule: 'yes', listAgents: false })
+  assert(dirty.schedule === false && dirty.listAgents === false, 'non-boolean schedule not defaulted')
+  assert(normalizeCompat(undefined).schedule === false, 'undefined not defaulted')
+  assert(normalizeCompat(null).listAgents === true, 'null not defaulted')
+})
+check('compatibilityFrom lets explicit config override detection', () => {
+  const got = compatibilityFrom({ config: { compat: { schedule: true, listAgents: false } }, get: () => null })
+  assert(got.schedule === true && got.listAgents === false, 'explicit config ignored')
+})
+check('compatibilityFrom auto-detects the host schedule service', () => {
+  const viaGet = compatibilityFrom({ get: (name) => (name === 'schedule' ? {} : null) })
+  assert(viaGet.schedule === true && viaGet.listAgents === false, 'ctx.get(schedule) not detected')
+  const viaProp = compatibilityFrom({ schedule: {} })
+  assert(viaProp.schedule === true && viaProp.listAgents === false, 'ctx.schedule not detected')
+})
+check('compatibilityFrom falls back to baseline with no service and no config', () => {
+  for (const ctx of [{}, { get: () => null }, { get: () => { throw new Error('no service') } }]) {
+    const got = compatibilityFrom(ctx)
+    assert(got.schedule === false && got.listAgents === true, 'baseline fallback broke')
+  }
 })
 check('the delegation group is mounted and isolates workflowEngine', () => {
   // `workflow-ptc` publishes `workflowEngine`. A provider mounted without an
