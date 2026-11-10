@@ -102,11 +102,22 @@ export function normalizeCompat(value) {
  * Resolve the switch for a live activation: explicit config wins, then host
  * capability detection, then the old-host-safe baseline.
  *
+ * `config` is the resolved row config cordis passes as apply()'s second argument.
+ * It is a plain object, so config.compat is safe; a live cordis Context is a Proxy
+ * whose get trap throws for undeclared properties, so ctx.config is only a
+ * fallback for offline plain-object callers and is read inside a try/catch.
+ *
  * @param {import('@deepseek-ai/cordis').Context} [ctx] - owning plugin context.
+ * @param {{compat?: unknown}} [config] - resolved row config from cordis.
  * @returns {{schedule: boolean, listAgents: boolean}} the resolved pair.
  */
-export function compatibilityFrom(ctx) {
-  const explicit = ctx?.config?.compat
+export function compatibilityFrom(ctx, config) {
+  let explicit
+  try {
+    explicit = config?.compat ?? ctx?.config?.compat
+  } catch {
+    explicit = undefined
+  }
   if (explicit !== undefined && explicit !== null) return normalizeCompat(explicit)
   let hasSchedule = false
   try {
@@ -506,9 +517,10 @@ export function buildDefinition(warn, options = {}) {
  * activation transaction, and taking that down would damage unrelated plugins.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx - owning plugin context, relying on the injected `agentPresets` Service.
+ * @param {object} [config] - resolved row config passed by cordis (plain object, carries `compat`).
  * @returns {void}
  */
-export function apply(ctx) {
+export function apply(ctx, config) {
   const warn = (message) => ctx.logger?.warn?.(message)
   const log = (message) => ctx.logger?.info?.(message)
 
@@ -526,7 +538,7 @@ export function apply(ctx) {
 
   let definition
   try {
-    definition = buildDefinition(warn, { compat: compatibilityFrom(ctx) })
+    definition = buildDefinition(warn, { compat: compatibilityFrom(ctx, config) })
   } catch (error) {
     // buildDefinition reads the asset and should not throw, but a preset the
     // registry never sees must still not break the surrounding activation.

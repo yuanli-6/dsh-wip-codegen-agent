@@ -210,6 +210,13 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 > 通用源码；`verify.mjs` 对两种组合都加了断言。升级后请按上面「宿主版本兼容开关」确认本机配置，
 > 不要再手改 `index.js`。
 
+> **v2.7.3 修复新宿主下预设不注册**：v2.7.2 的 `compatibilityFrom(ctx)` 直接读 `ctx.config.compat`，
+> 而 DSH 新版宿主（cordis）的 `ctx` 是 Proxy，读取未注入的 `config` 属性会抛
+> `cannot get property "config" without inject`；`apply()` 的 try/catch 在 `register()` 之前就返回，
+> 注册表里始终没有 `wip-codegen`，表现为「Agent 找不到了」（`Unknown agent preset: wip-codegen`）。
+> 现在改为接收 cordis 传入的 `config` 参数（plain object，不触发 Proxy），`ctx.config` 仅作离线
+> 回退；`apply(fakeCtx)` 这种单参调用行为不变。纯源码改动，热加载即生效，不必重装。
+
 ### 复合索引：先查索引，再决定读不读源码（v2.5.0 起）
 
 规范 §十七 要求：回答项目结构 / 业务逻辑类问题前，**先查索引**；命中且**文件 hash 未变**时用
