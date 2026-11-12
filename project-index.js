@@ -1,5 +1,5 @@
 /**
- * Composite project index: the `.dsh/index/` directory that §十七 of the spec
+ * Composite project index: the `.dsh/index/` directory that §八 of the spec
  * tells the Agent to trust before it reads any source file.
  *
  * One 10 MB JSON file is not an index, it is a trap: a mid-sized Java project
@@ -1723,7 +1723,7 @@ export function summarizeDirectory(relDir, children) {
 //
 // The spec body, the AGENTS.md files and this plugin's own config are *rules*,
 // and v2 of the index knew nothing about them: the model had to guess where the
-// spec lived and re-read tens of KB of Markdown to answer "what does §十四 say
+// spec lived and re-read tens of KB of Markdown to answer "what does the spec say
 // about deleting a file". They are indexed here instead, split by heading, so a
 // keyword query lands on the section that answers it.
 
@@ -1762,12 +1762,12 @@ function isInsideRoot(root, absolute) {
 /**
  * The `§`-prefixed form of a chapter heading.
  *
- * The spec writes its chapters as `## 十四、强制交互流程：先确认，再落地`, while
- * every reference to one — and the model's own queries — says `§十四`. Storing
- * the `§` form is what makes `queryIndex(index, '§十四')` land at all.
+ * The spec writes its chapters as `## 二、工作方式总则（先定位，后思考）`, while
+ * every reference to one — and the model's own queries — says `§二`. Storing
+ * the `§` form is what makes `queryIndex(index, '§二')` land at all.
  *
  * @param {string} title - heading text, `#` marks already stripped.
- * @returns {string} e.g. `§十四 强制交互流程：先确认，再落地`.
+ * @returns {string} e.g. `§二 工作方式总则（先定位，后思考）`.
  */
 function sectionTitle(title) {
   const matched = /^([一二三四五六七八九十百]+)、\s*(.*)$/.exec(title)
@@ -3647,7 +3647,7 @@ const TOOL_DESCRIPTION =
   'action=read 读某个文件的结构化条目（类、字段、方法、构造器、常量与枚举值、注解参数、行号、引用关系、业务规则），' +
   '可用 symbol 收窄到单个类或方法；' +
   'action=verify 校验某个文件的条目是否仍然可信（改源码之前做这一步）；action=build 强制全量重建（通常不必手动调用）。' +
-  '索引的第四块 agent_rules_index（落在 agent_rules.json）收录了 Agent 规范正文（§一～§十七）、AGENTS.md 全局/项目约定、插件配置与 docs 文档：' +
+  '索引的第四块 agent_rules_index（落在 agent_rules.json）收录了 Agent 规范正文（§一～§十一）、AGENTS.md 全局/项目约定、插件配置与 docs 文档：' +
   'action=query 用关键词（如「导出」「确认流程」「wbs_num」）可直接命中规范条目，' +
   'action=read path=system-prompt.md 可按节读规范，action=verify 对它同样比对 sha256；' +
   '本工具不会等待构建完成：索引缺失时它直接说明现状，此时改用 grep/glob/read 回答当前问题，' +

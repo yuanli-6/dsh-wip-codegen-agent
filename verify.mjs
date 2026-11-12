@@ -102,14 +102,14 @@ check('spec has no UTF-8 BOM', () => {
 check('spec is substantial (guards against a truncated asset)', () => {
   assert(rawSpec.length > 5000, `only ${rawSpec.length} chars — expected the full team spec`)
 })
-check('spec mentions the four required inputs', () => {
-  for (const needle of ['建表 SQL', 'UI 截图', 'Excel 样例', 'SAP 字段映射']) {
+check('spec mentions the required inputs', () => {
+  for (const needle of ['建表 SQL', '字段清单', 'Excel', '截图', '需求描述']) {
     assert(rawSpec.includes(needle), `spec no longer mentions "${needle}"`)
   }
 })
 check('spec carries the SQL Server table-script rules', () => {
   for (const needle of [
-    '## 十三、SQL Server 建表脚本生成规范',
+    '## 十一、建表脚本生成（低频）',
     'sp_addextendedproperty',
     'DATETIME2(0)',
     'IX_{表名}_{字段名}',
@@ -121,89 +121,73 @@ check('spec carries the SQL Server table-script rules', () => {
 })
 check('spec carries the mandatory confirmation flow', () => {
   for (const needle of [
-    '## 十四、强制交互流程：先确认，再落地',
-    '14.2 SQL 字段确认',
-    '14.3 Java 代码生成确认',
-    '14.4 风格基准',
-    '14.5 删除确认',
-    '14.6 全局规则沉淀',
+    '## 七、代码生成工作流',
+    '### 7.1 风格基准',
+    '### 7.2 生成节奏',
+    '### 7.3 输出要求',
+    '### 7.4 删除与新建确认',
+    '### 11.1 触发与字段确认',
     'ask_user_question'
   ]) {
     assert(rawSpec.includes(needle), `spec no longer contains "${needle}"`)
   }
 })
 check('spec exposes an append target for global rules', () => {
-  assert(rawSpec.includes('## 十五、全局规则（用户追加）'), '§十五 is missing, §14.6 would have nowhere to append')
+  assert(rawSpec.includes('## 十、全局规则（用户追加）'), '§十 is missing, global rules would have nowhere to append')
 })
 check('spec tells the model when to delegate, since the tool rows cannot', () => {
   // `tool-subagent` and `tool-workflow` register their own prompt sections, and
   // this preset's persona is `complete: true` — assembly keeps only that one
-  // section, so their guidance never reaches the model. §16.10 is the only
+  // section, so their guidance never reaches the model. §8.3 is the only
   // thing that tells it the tools exist and what they cost.
-  for (const needle of ['### 16.10', 'subagent', 'workflow', '正在改的那一个文件必须自己读']) {
-    assert(rawSpec.includes(needle), `§16.10 no longer mentions "${needle}"`)
+  for (const needle of ['### 8.3 读源码的红线', 'subagent', '3 个以上文件', '主线只收摘要']) {
+    assert(rawSpec.includes(needle), `§8.3 no longer mentions "${needle}"`)
   }
 })
-check('spec makes the project index the default way in (§十七)', () => {
-  // The `project_index` tool description states the contract of the tool; §十七
+check('spec makes the project index the default way in (§八)', () => {
+  // The `project_index` tool description states the contract of the tool; §八
   // states the contract of the *session* — query first, do not read sources
   // unless the user asked for a source change. Both are needed: the tool
   // description is only read when the model is already considering the tool.
   for (const needle of [
-    '## 十七、项目索引优先（本预设的默认工作方式）',
+    '## 八、项目索引与检索（多层级索引机制）',
     '.dsh/index/',
     'master_index.json',
     'shards/',
     'logic_rules.json',
-    'agent_rules.json',
-    'project_meta',
-    'directory_index',
-    'content_logic_index',
-    'logic_details',
-    '除非用户明确要求改源码，否则绝不全量读取源码文件',
+    '必须使用 project_index 工具访问',
+    '绝不全量读取源码文件',
     '已触发后台索引构建，当前我先基于原生检索为您解答',
     'action=verify',
     'sha256'
   ]) {
-    assert(rawSpec.includes(needle), `§十七 no longer mentions "${needle}"`)
-  }
-  // The multi-file layout is the whole point of §十七.1: a single 10 MB JSON is
-  // a trap, and the spec has to name the split, the per-shard ceiling and the
-  // legacy file that gets deleted on sight — otherwise the model goes looking
-  // for a file that no longer exists.
-  for (const needle of [
-    '800 KB',
-    'project_index.json',
-    '直接删除并按新结构重建'
-  ]) {
-    assert(rawSpec.includes(needle), `§十七 no longer explains the split ("${needle}")`)
+    assert(rawSpec.includes(needle), `§八 no longer mentions "${needle}"`)
   }
   // Three steps, and the ceiling on step three. "Read the file" is what the
-  // split exists to prevent, so the spec has to forbid the whole-file read and
+  // index exists to prevent, so the spec has to forbid the whole-file read and
   // name a line budget.
-  for (const needle of ['### 17.2 三步走', '行号', 'line+50', '300 行']) {
-    assert(rawSpec.includes(needle), `§十七 lost the three-step / line-budget rule ("${needle}")`)
+  for (const needle of ['### 8.1 三步走工作流', 'action=status', 'action=query', 'action=read', 'line+50', '300 行']) {
+    assert(rawSpec.includes(needle), `§八 lost the three-step / line-budget rule ("${needle}")`)
   }
   // Terminal output is the other way a context window dies.
   assert(
-    rawSpec.includes('### 17.5 终端命令防爆内存') && rawSpec.includes('Select-Object -First 50'),
-    '§十七 no longer caps terminal output'
+    rawSpec.includes('### 8.4 终端命令防爆内存') && rawSpec.includes('Select-Object -First 50'),
+    '§八 no longer caps terminal output'
   )
   // Trust is decided by content hash, never by the age of the index. A lease
   // cannot distinguish a fresh entry from a stale one — an index built one
-  // second ago can still describe an older file. Pinning the wording here keeps
-  // the spec from drifting back to "built within 30 minutes means trustworthy".
+  // second ago can still describe an older file.
   assert(
-    rawSpec.includes('### 17.3 可信度看 hash，不看时间'),
-    '§十七 lost the section that makes hash the trust criterion'
+    rawSpec.includes('### 8.2 可信度判定与降级策略（红线）'),
+    '§八 lost the section that makes hash the trust criterion'
   )
   assert(
     rawSpec.includes('hash 一致') && rawSpec.includes('hash 不一致'),
-    '§十七 no longer states what hash agreement and disagreement mean'
+    '§八 no longer states what hash agreement and disagreement mean'
   )
   assert(
-    !/`last_updated` 在 30 分钟内/.test(rawSpec),
-    '§十七 has drifted back to a time-based freshness rule'
+    rawSpec.includes('只看 hash，不看时间'),
+    '§八 has drifted back to a time-based freshness rule'
   )
 })
 
@@ -337,7 +321,7 @@ check('persona body is the spec plus only the trailing notes', () => {
   const extra = personaBody.slice(expected.length)
   assert(
     extra.includes('system-prompt.md'),
-    'the spec-path note is missing, so §14.6 has no file to append global rules to'
+    'the spec-path note is missing, so §十 has no file to append global rules to'
   )
   assert(extra.length < 400, `unexpected extra prose after the spec (${extra.length} chars)`)
 })

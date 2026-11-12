@@ -27,7 +27,7 @@
  * activation, so that file stays the editable source of truth. Because the
  * definition is handed to the registry as a plain JS object (not YAML text),
  * the body cannot be mangled by any serializer on the way in. The same file is
- * the spec's §十五 global-rules store, so its absolute path is injected into
+ * the spec's §十 global-rules store, so its absolute path is injected into
  * the prompt: the Agent must be able to find the file it appends rules to.
  *
  * The API-testing companion is mounted *gated on resolvability*. A preset row
@@ -185,15 +185,15 @@ const AGENTS_MAX_BYTES = 65536
  * fatal — the loop registers only `provider` and `model`, and strict
  * interpolation throws on anything else.
  *
- * The spec path is the remaining fact the agent cannot derive: §14.6 tells it
- * to append user-declared global rules to §十五 of *this* file, and the file
+ * The spec path is the remaining fact the agent cannot derive: §十 tells it
+ * to append user-declared global rules to *this* file, and the file
  * lives in the installed package, whose location the agent cannot guess.
  */
 function trailingNotes() {
   return [
     '---',
     '',
-    `规范正文路径（§十五 全局规则追加到该文件）：${fileURLToPath(SPEC_FILE_URL)}`
+    `规范正文路径（§十 全局规则追加到该文件）：${fileURLToPath(SPEC_FILE_URL)}`
   ].join('\n')
 }
 

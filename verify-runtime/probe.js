@@ -188,9 +188,9 @@ async function observe(ctx) {
       flatRowCount: leafRows.length,
       rows: leafRows.map((row) => row.name),
       specChars: body.length,
-      specHasSqlSection: body.includes('十三、SQL Server 建表脚本生成规范'),
-      specHasConfirmation: body.includes('十四、强制交互流程'),
-      specHasGlobalRules: body.includes('十五、全局规则（用户追加）'),
+      specHasSqlSection: body.includes('## 十一、建表脚本生成'),
+      specHasConfirmation: body.includes('### 7.4 删除与新建确认'),
+      specHasGlobalRules: body.includes('## 十、全局规则（用户追加）'),
       specPathInjected: body.includes('system-prompt.md')
     }
   } catch (error) {

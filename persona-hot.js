@@ -5,7 +5,7 @@
  * row config, and a preset row's config is `structuredClone`d when the preset
  * is mounted. So the body is frozen at activation: editing
  * `assets/wip-codegen/system-prompt.md` changes nothing until the whole plugin
- * is reinstalled, which for a file whose §十五 grows every session is the
+ * is reinstalled, which for a file whose §十 grows every session is the
  * single most annoying property of this bundle.
  *
  * This row exists to remove that. It registers the *same* section name

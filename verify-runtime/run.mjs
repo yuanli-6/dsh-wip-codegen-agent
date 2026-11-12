@@ -388,7 +388,7 @@ if (start === -1 || end === -1) {
     assert(observation.bundle.specHasConfirmation, 'confirmation section missing')
     assert(observation.bundle.specHasGlobalRules, 'global-rules section missing')
   })
-  check('the spec path is injected so §14.6 has a file to append to', () => {
+  check('the spec path is injected so §十 has a file to append to', () => {
     assert(observation.bundle.specPathInjected, 'spec path note missing from the prompt')
   })
 }
