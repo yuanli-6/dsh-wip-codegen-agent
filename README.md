@@ -186,7 +186,7 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 > - **改成 master + shards**：`master_index.json`（项目概况 + 宏观目录树 + 分片清单，**37 KB**）、
 >   `shards/*.json`（按业务域分片，**每片硬上限 800 KB**，实测 21 片、最大 795 KB、合计 5.8 MB）、
 >   `logic_rules.json`（全项目业务规则单独成片，770 KB）、`agent_rules.json`（规范正文/AGENTS.md/
->   插件配置/docs 按标题切片，150 KB）。
+>   插件配置按标题切片，150 KB）。
 > - **超限先按路径前缀拆，再按大小切**：`service_impl` 一个包下 142 个 Impl 无法按目录拆开，于是
 >   `service_impl.wip-service_1.json`（119 个）/ `_2.json`（23 个）—— 拆分是确定性的，每次重建结果一致。
 > - **分片写紧凑、master 写缩进**：同一份数据加两空格缩进会从 5.8 MB 涨到 6.1 MB 且出现两片超 1 MB，
@@ -219,6 +219,12 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 
 > **v2.7.4 对齐精简后的 11 章规范**：正文由 17 章合并为 11 章（建表脚本 → §十一、确认流程 → §七、全局规则 → §十、项目索引 → §八）。`verify.mjs` 的 6 组断言、`verify-runtime/probe.js` 的三段探测、`index.js` 注入的规范正文路径行、`project-index.js` 的工具描述与注释、README 当前行为段里的旧章号引用全部改按新章号；历史 changelog 保留原编号不回溯改。纯配置 / 文档对齐，正文逻辑不变。
 
+> **v2.7.5 索引不再收 `docs/**`**：`agent_rules.json` 的 `doc` 类此前把 `docs/**/*.md` 全量收进来，
+> 这些文档描述产品意图、改动频繁却不经过 `AGENTS.md`，索引里留下的是一份过期副本（wip-srv 上占
+> 7 个文件 / 114 KB、134 个 section）。现在 `collectAgentRuleFiles()` 只收项目根的 `*.md`
+> （`README.md` 这类），`collectMarkdown()` 一并删除；`doc` 类条目从 13 条降到 6 条、
+> `agent_rules.json` 从 156 KB 降到 40 KB。纯索引范围收紧，规范正文与工具契约不变。
+
 ### 复合索引：先查索引，再决定读不读源码（v2.5.0 起）
 
 规范 §八 要求：回答项目结构 / 业务逻辑类问题前，**先查索引**；命中且**文件 hash 未变**时用
@@ -237,7 +243,7 @@ target: github:yuanli-6/dsh-wip-codegen-agent
 <项目根>/.dsh/index/shards/controller.json
 <项目根>/.dsh/index/shards/mapper.json     # …共 21 片，全部 ≤ 800 KB
 <项目根>/.dsh/index/logic_rules.json       # 全项目业务规则，按文件路径索引（~770 KB）
-<项目根>/.dsh/index/agent_rules.json       # 规范正文/AGENTS.md/插件配置/docs，按标题切片（~150 KB）
+<项目根>/.dsh/index/agent_rules.json       # 规范正文/AGENTS.md/插件配置，按标题切片（~150 KB）
 <项目根>/.dsh/index/file-cache.json        # 旁挂：每个文件的 size + mtime + sha256（增量记账）
 ```
 

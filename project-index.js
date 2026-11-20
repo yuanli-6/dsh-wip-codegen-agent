@@ -123,7 +123,7 @@ export const CACHE_FILE = 'file-cache.json'
  * 2: annotation argument values, line numbers, imports, interface constants,
  *    enum values, constructors and cross-file relations joined the entry.
  * 3: the fourth block `agent_rules_index` — the Agent's own rules (spec body,
- *    AGENTS.md, plugin config, project docs) indexed with per-heading slices,
+ *    AGENTS.md, plugin config) indexed with per-heading slices,
  *    so "规范里怎么写导出" is a query instead of a 45 KB file read.
  * 4: the single 10 MB file became a directory — `master_index.json` (meta +
  *    directory tree + shard manifest), `shards/*.json` (the per-file entries,
@@ -1878,38 +1878,14 @@ function ruleSummary(source, relPath) {
 }
 
 /**
- * Markdown files under one directory, as paths relative to the project root.
- *
- * @param {string} directory - directory to walk.
- * @param {string} prefix - its path relative to the project root.
- * @param {string[]} out - collector, appended to.
- * @returns {Promise<void>} resolves when the walk is done.
- */
-async function collectMarkdown(directory, prefix, out) {
-  let entries
-  try {
-    entries = await readdir(directory, { withFileTypes: true })
-  } catch {
-    return
-  }
-  for (const entry of entries) {
-    if (isSkippedSegment(entry.name)) continue
-    const rel = `${prefix}/${entry.name}`
-    if (entry.isDirectory()) {
-      await collectMarkdown(join(directory, entry.name), rel, out)
-      continue
-    }
-    if (entry.isFile() && /\.md$/i.test(entry.name)) out.push(rel)
-  }
-}
-
-/**
  * Every file the rules block covers.
  *
  * In order: the spec body, this plugin's config, the global `AGENTS.md`
  * (whichever of `DSH_HOME` / `DSH_AGENTS_HOME` exists), the `AGENTS.md` of each
- * directory from the project root up to the `.git` root, and the project's own
- * Markdown (`docs/**` plus the root's `*.md`).
+ * directory from the project root up to the `.git` root, and the root's own
+ * `*.md`. `docs/**` is deliberately not collected: those documents describe
+ * product intent and drift without anyone touching the rules, so indexing them
+ * keeps answering from a stale copy.
  *
  * A missing file is skipped, never an error: a project without `AGENTS.md` and a
  * machine without `DSH_HOME` are both normal. The walk is separate from
@@ -1966,11 +1942,9 @@ async function collectAgentRuleFiles(root) {
     directory = parent
   }
 
-  /** @type {string[]} */
-  const markdown = []
-  await collectMarkdown(join(root, 'docs'), 'docs', markdown)
-  for (const rel of markdown) add(join(root, ...rel.split('/')), 'doc')
-
+  // Only the root's own Markdown. `docs/**` is deliberately skipped: those files
+  // describe product intent and drift without anyone touching the rules, so an
+  // index of them would keep answering from a stale copy.
   try {
     const top = await readdir(root, { withFileTypes: true })
     for (const entry of top) {
@@ -3185,7 +3159,7 @@ export function formatRead(entry, relPath) {
     return (
       `索引里没有「${relPath}」。\n` +
       '先用 action=query 找一个文件路径；Java 与 MyBatis XML 在 content_logic_index 里，' +
-      'Agent 规范 / AGENTS.md / 插件配置 / docs 文档在 agent_rules_index 里（如 path=system-prompt.md）。'
+      'Agent 规范 / AGENTS.md / 插件配置在 agent_rules_index 里（如 path=system-prompt.md）。'
     )
   }
   if (entry.file === null && entry.logic === null && entry.directory === null) {
@@ -3647,7 +3621,7 @@ const TOOL_DESCRIPTION =
   'action=read 读某个文件的结构化条目（类、字段、方法、构造器、常量与枚举值、注解参数、行号、引用关系、业务规则），' +
   '可用 symbol 收窄到单个类或方法；' +
   'action=verify 校验某个文件的条目是否仍然可信（改源码之前做这一步）；action=build 强制全量重建（通常不必手动调用）。' +
-  '索引的第四块 agent_rules_index（落在 agent_rules.json）收录了 Agent 规范正文（§一～§十一）、AGENTS.md 全局/项目约定、插件配置与 docs 文档：' +
+  '索引的第四块 agent_rules_index（落在 agent_rules.json）收录了 Agent 规范正文（§一～§十一）、AGENTS.md 全局/项目约定与插件配置：' +
   'action=query 用关键词（如「导出」「确认流程」「wbs_num」）可直接命中规范条目，' +
   'action=read path=system-prompt.md 可按节读规范，action=verify 对它同样比对 sha256；' +
   '本工具不会等待构建完成：索引缺失时它直接说明现状，此时改用 grep/glob/read 回答当前问题，' +
